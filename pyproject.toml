@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsvara"
+version = "0.1.0"
+description = "Full svara transcription for Carnatic music: RISE encoder, TCN embedding, GAME boundary diffusion, svara classifier"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Vivek Vijayan" },
+]
+keywords = [
+    "Carnatic music",
+    "svara transcription",
+    "note transcription",
+    "music information retrieval",
+]
+
+dependencies = [
+    "librosa>=0.10",
+    "matplotlib>=3.8",
+    "mir_eval>=0.8",
+    "mirdata>=0.3.6",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "peft>=0.14",
+    "PyYAML>=6.0",
+    "rich>=13.0",
+    "scikit-learn>=1.5",
+    "scipy>=1.11",
+    "seaborn>=0.13",
+    "torch>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
