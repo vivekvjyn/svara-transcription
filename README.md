@@ -1,7 +1,9 @@
 # Transvara
 
-Svara transcription for Carnatic music: a RISE encoder, TCN embedding and GAME
-diffusion segmenter fine-tuned jointly to turn a pitch track into note events.
+Svara transcription for Carnatic music. Stage 1 trains a svara classifier over
+a RISE encoder and TCN embedding with pitch context, stage 2 fine-tunes the
+GAME diffusion segmenter on fused compIAM TCN Carnatic audio embeddings and the
+svara onset/offset annotation.
 
 ## Setup
 
@@ -11,13 +13,13 @@ cd transvara
 pip install -e .
 ```
 
-Pretrained weights go in `weights/`:
+Pretrained weights go in `model_weights/`:
 
 | File | Model |
 |---|---|
-| `rise_pretrained.pth` | RISE encoder |
-| `tcn_carnatic_pretrained.pth` | compIAM TCN Carnatic |
-| `game_pretrained_{small,medium,large}.pt` | GAME segmenter |
+| `rise/rise_pretrained.pth` | RISE encoder |
+| `tcn/tcn_carnatic_pretrained.pth` | compIAM TCN Carnatic |
+| `game/game_pretrained.pt` | GAME segmenter |
 
 ## Running
 
@@ -26,8 +28,11 @@ python scripts/train.py
 python scripts/eval.py
 ```
 
-Checkpoints are saved to `weights/runs/<tag>/`, metrics tables and plots to
-`results/`. Hyperparameters are in `config.yaml`.
+`train.py` runs both stages: the classifier writes `classifier.pth`, then the
+segmenter and audio fusion write `best.pth`, both under
+`model_weights/runs/`. `eval.py` transcribes the held-out test set and
+reports fuzzy alignment, onset/offset and svara F. Metrics tables and plots go
+to `results/`. Hyperparameters are in `config.yaml`.
 
 ## Licence
 

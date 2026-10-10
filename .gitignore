@@ -3,5 +3,3 @@
 *.egg-info
 .cache
 *.mp3
-weights/
-results/

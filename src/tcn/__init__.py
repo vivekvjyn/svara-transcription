@@ -1,3 +1,3 @@
-from .model import ResBlock, TCN
+from .model import CarnaticAudioEncoder, ResBlock, TCN
 
-__all__ = ["ResBlock", "TCN"]
+__all__ = ["CarnaticAudioEncoder", "ResBlock", "TCN"]

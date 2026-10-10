@@ -16,7 +16,7 @@ from game import (
     remove_boundaries,
 )
 from rise import FrameEncoder, apply_lora
-from tcn import TCN
+from tcn import CarnaticAudioEncoder, TCN
 
 
 def load_encoder_weights(path: Path | str, device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
@@ -49,7 +49,13 @@ class TranscriptionModel(nn.Module):
 
         self.encoder = FrameEncoder(embed_dim, depth)
         self.embedding = TCN(embed_dim, tcn_filters, kernel_size=tcn_kernel, n_dilations=tcn_dilations, dropout_rate=dropout)
-        self.segmenter = Segmenter(tcn_filters, depth=segmenter_depth, kernel=tcn_kernel, dropout=dropout)
+        self.audio_encoder = CarnaticAudioEncoder(dropout=dropout)
+        self.segmenter = Segmenter(
+            tcn_filters + self.audio_encoder.out_channels,
+            depth=segmenter_depth,
+            kernel=tcn_kernel,
+            dropout=dropout,
+        )
         self.pool = LocalDownsample()
         self.classifier = nn.Sequential(
             nn.LayerNorm(tcn_filters),
@@ -58,48 +64,68 @@ class TranscriptionModel(nn.Module):
             nn.Linear(tcn_filters, num_classes),
         )
         self.boundary_loss = GaussianSoftBoundaryLoss(boundary_std)
+        for parameter in self.audio_encoder.parameters():
+            parameter.requires_grad = False
 
     def encode(self, inputs: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.embedding(self.encoder(inputs))
         return hidden
 
-    def training_outputs(
+    def encode_audio(self, features: torch.Tensor) -> torch.Tensor:
+        self.audio_encoder.eval()
+        return self.audio_encoder(features)
+
+    def fuse(self, embedding: torch.Tensor, audio_embedding: torch.Tensor) -> torch.Tensor:
+        return torch.cat([embedding, audio_embedding], dim=1)
+
+    def classifier_outputs(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         boundaries: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         embedding = self.encode(inputs)
-        batch = boundaries.shape[0]
-        t = torch.rand(batch, device=boundaries.device)
-        corrupted = remove_boundaries(boundaries, d3pm_time_schedule(t))
-        segmenter_logits = self.segmenter(embedding, boundaries_to_regions(corrupted), t)
-
         regions = boundaries_to_regions(boundaries)
         region_logits = self.classifier(self.pool(embedding.transpose(1, 2), regions))
-
         present = torch.arange(region_logits.shape[1], device=regions.device) <= regions.max(dim=1).values.unsqueeze(1)
         return {
-            "boundary_logits": segmenter_logits,
             "region_logits": region_logits,
             "region_labels": region_label_counts(targets, regions, self.num_classes).argmax(dim=-1)[:, 1:],
             "region_mask": present,
+            "regions": regions,
         }
 
-    @torch.no_grad()
-    def transcribe(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.transcribe_embedding(self.encode(inputs))
+    def segmenter_outputs(
+        self,
+        inputs: torch.Tensor,
+        audio_features: torch.Tensor,
+        boundaries: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        embedding = self.fuse(self.encode(inputs), self.encode_audio(audio_features))
+        batch = boundaries.shape[0]
+        t = torch.rand(batch, device=boundaries.device)
+        corrupted = remove_boundaries(boundaries, d3pm_time_schedule(t))
+        return {"boundary_logits": self.segmenter(embedding, boundaries_to_regions(corrupted), t)}
 
     @torch.no_grad()
-    def transcribe_embedding(self, embedding: torch.Tensor) -> dict[str, torch.Tensor]:
+    def transcribe(self, inputs: torch.Tensor, audio_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.transcribe_embedding(self.encode(inputs), self.encode_audio(audio_features))
+
+    @torch.no_grad()
+    def transcribe_embedding(
+        self,
+        embedding: torch.Tensor,
+        audio_embedding: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         was_training = self.training
         self.eval()
+        fused = self.fuse(embedding, audio_embedding)
         boundaries = torch.zeros(embedding.shape[0], embedding.shape[2], dtype=torch.bool, device=embedding.device)
         step = torch.full((1,), 1 / self.d3pm_steps, device=embedding.device)
         for index in range(self.d3pm_steps):
             t = index * step.expand(embedding.shape[0])
             boundaries = remove_boundaries(boundaries, d3pm_time_schedule(t))
-            logits = self.segmenter(embedding, boundaries_to_regions(boundaries), t)
+            logits = self.segmenter(fused, boundaries_to_regions(boundaries), t)
             boundaries = decode_soft_boundaries(
                 logits.sigmoid(), threshold=self.boundary_threshold, radius=self.boundary_radius
             )
@@ -117,6 +143,9 @@ class TranscriptionModel(nn.Module):
 
     def load_pretrained_encoder(self, checkpoint: Path | str, device: torch.device | str = "cpu") -> None:
         self.encoder.load_state_dict(load_encoder_weights(checkpoint, device))
+
+    def load_pretrained_audio_encoder(self, checkpoint: Path | str, device: torch.device | str = "cpu") -> None:
+        self.audio_encoder.load_pretrained(checkpoint, device)
 
     def apply_lora(self, rank: int = 8, alpha: int = 16, dropout: float = 0.05) -> None:
         self.encoder = apply_lora(self.encoder, rank, alpha, dropout)

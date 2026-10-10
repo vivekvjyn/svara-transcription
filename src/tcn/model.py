@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class ResBlock(nn.Module):
@@ -40,3 +43,55 @@ class TCN(nn.Module):
         x = self.activation(x)
         skip = torch.stack(skip_connections, dim=-1).sum(dim=-1)
         return x, skip
+
+
+class CarnaticAudioEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        bands: int = 81,
+        filters: int = 20,
+        kernel_size: int = 5,
+        n_dilations: int = 11,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        self.bands = bands
+        self.out_channels = filters
+        self.conv_1 = nn.Conv2d(1, filters, kernel_size=(3, 3), stride=1, padding="valid")
+        self.elu_1 = nn.ELU()
+        self.mp_1 = nn.MaxPool2d((1, 3))
+        self.dropout_1 = nn.Dropout(dropout)
+        self.conv_2 = nn.Conv2d(filters, filters, kernel_size=(1, 10), stride=1, padding="valid")
+        self.elu_2 = nn.ELU()
+        self.mp_2 = nn.MaxPool2d((1, 3))
+        self.dropout_2 = nn.Dropout(dropout)
+        self.conv_3 = nn.Conv2d(filters, filters, kernel_size=(3, 3), stride=1, padding="valid")
+        self.elu_3 = nn.ELU()
+        self.mp_3 = nn.MaxPool2d((1, 3))
+        self.dropout_3 = nn.Dropout(dropout)
+        self.tcn = TCN(
+            filters,
+            filters,
+            kernel_size=kernel_size,
+            n_dilations=n_dilations,
+            dropout_rate=dropout,
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.shape[-1] != self.bands:
+            raise ValueError(f"expected {self.bands} filter bands, got {features.shape[-1]}")
+        x = features.unsqueeze(1)
+        x = F.pad(x, (0, 0, 2, 2), mode="replicate")
+        x = self.dropout_1(self.mp_1(self.elu_1(self.conv_1(x))))
+        x = self.dropout_2(self.mp_2(self.elu_2(self.conv_2(x))))
+        x = self.dropout_3(self.mp_3(self.elu_3(self.conv_3(x))))
+        x = x.squeeze(-1)
+        hidden, _ = self.tcn(x)
+        return hidden
+
+    def load_pretrained(self, checkpoint: Path | str, device: torch.device | str = "cpu") -> None:
+        state = torch.load(Path(checkpoint), map_location=device, weights_only=True)
+        heads = ("beats_", "downbeats_", "tempo_")
+        trunk = {key: value for key, value in state.items() if not key.startswith(heads)}
+        self.load_state_dict(trunk)
