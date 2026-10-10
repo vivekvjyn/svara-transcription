@@ -1,26 +1,39 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import torch
 from torch import nn
 
-from game import (
-    GaussianSoftBoundaryLoss,
-    LocalDownsample,
-    Segmenter,
-    boundaries_to_regions,
-    decode_soft_boundaries,
-    d3pm_time_schedule,
-    first_frame_index,
-    remove_boundaries,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "GAME"))
+
+from modules.commons.common_layers import CyclicRegionEmbedding, LocalDownsample
+from modules.decoding import decode_soft_boundaries
+from modules.d3pm import d3pm_time_schedule, remove_boundaries
+from modules.functional import boundaries_to_regions
+from modules.losses.boundary_loss import GaussianSoftBoundaryLoss
 from rise import FrameEncoder, apply_lora
 from tcn import CarnaticAudioEncoder, TCN
 
 
 def load_encoder_weights(path: Path | str, device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
     return torch.load(Path(path), map_location=device, weights_only=True)
+
+
+class Segmenter(nn.Module):
+    def __init__(self, channels: int, *, depth: int = 6, kernel: int = 5, dropout: float = 0.15) -> None:
+        super().__init__()
+        self.region_embedding = CyclicRegionEmbedding(channels)
+        self.time_embedding = nn.Sequential(nn.Linear(1, 4 * channels), nn.ELU(), nn.Linear(4 * channels, channels))
+        self.context = TCN(channels, channels, kernel_size=kernel, n_dilations=depth, dropout_rate=dropout)
+        self.readout = nn.Conv1d(channels, 1, kernel_size=1)
+
+    def forward(self, embedding: torch.Tensor, regions: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        context = embedding + self.region_embedding(regions).transpose(1, 2)
+        context = context + self.time_embedding(t.unsqueeze(-1)).unsqueeze(-1)
+        hidden, _ = self.context(context)
+        return self.readout(hidden).squeeze(1)
 
 
 class TranscriptionModel(nn.Module):
@@ -157,6 +170,13 @@ class TranscriptionModel(nn.Module):
     @property
     def num_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def first_frame_index(regions: torch.Tensor) -> torch.Tensor:
+    batch, frames = regions.shape
+    first = torch.full((batch, int(regions.max()) + 1), frames, dtype=torch.long, device=regions.device)
+    positions = torch.arange(frames, device=regions.device).unsqueeze(0).expand(batch, -1)
+    return first.scatter_reduce(1, regions, positions, reduce="amin", include_self=True)
 
 
 def region_label_counts(targets: torch.Tensor, regions: torch.Tensor, num_classes: int) -> torch.Tensor:

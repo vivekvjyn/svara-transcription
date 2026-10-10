@@ -1,0 +1,3 @@
+[submodule "GAME"]
+	path = GAME
+	url = https://github.com/openvpi/GAME.git

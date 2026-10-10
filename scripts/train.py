@@ -5,12 +5,13 @@ import random
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
-import librosa
 import numpy as np
 import pandas as pd
 import torch
 import yaml
 from rich.console import Console
+from rich.progress import Progress
+from rich.table import Table
 from scipy.interpolate import UnivariateSpline
 from sklearn.metrics import f1_score
 
@@ -68,6 +69,9 @@ def main() -> None:
     num_classes = len(SVARAS) + 1
 
     console.print("[bold]tsvara train[/bold]")
+    table = Table()
+    table.add_column("option")
+    table.add_column("value")
     for key, value in {
         "epochs": args.epochs,
         "patience": args.patience,
@@ -76,40 +80,32 @@ def main() -> None:
         "warmup epochs": args.warmup_epochs,
         "lr heads": args.lr_heads,
         "lr encoder": args.lr_encoder,
-        "lr segmenter": args.lr_segmenter,
         "weight decay": args.weight_decay,
         "val fraction": args.val_fraction,
         "crops per epoch": args.crops_per_epoch,
-        "sample rate": args.sample_rate,
-        "audio fps": args.audio_fps,
-        "fft size": args.fft_size,
-        "hop size": args.hop_size,
-        "filter fmin": args.filter_fmin,
-        "filter fmax": args.filter_fmax,
-        "filter bands": args.filter_bands,
-        "log epsilon": args.log_epsilon,
         "seed": args.seed,
         "device": device,
     }.items():
-        console.print(f"    {key}: {value}")
-
-    hop = args.hop_size if args.hop_size else args.sample_rate // args.audio_fps
+        table.add_row(key, str(value))
+    console.print(table)
 
     console.print("\n[bold]Data[/bold]")
     tonics = yaml.safe_load((data_dir / "tonics.yaml").read_text())
 
-    mel_filters = librosa.filters.mel(
-        sr=args.sample_rate,
-        n_fft=args.fft_size,
-        n_mels=args.filter_bands,
-        fmin=args.filter_fmin,
-        fmax=args.filter_fmax,
-    ).T
-
+    progress = Progress()
+    task = progress.add_task(
+        "data",
+        total=sum(
+            len(list((data_dir / "pitch_tracks" / raga).glob("*.tsv"))) for raga in RAGAS
+        ),
+    )
+    progress.start()
+    skipped_notes = []
     performances = []
     for raga in RAGAS:
         for pitch_path in sorted((data_dir / "pitch_tracks" / raga).glob("*.tsv")):
             performer = pitch_path.stem
+            progress.update(task, description=f"{raga}/{performer}")
             frames_cache = cache_dir / "frames" / raga / f"{performer}.pt"
             if frames_cache.exists():
                 stored = torch.load(frames_cache, map_location="cpu", weights_only=False)
@@ -193,7 +189,7 @@ def main() -> None:
                 boundaries[0] = False
 
                 if skipped:
-                    console.print(
+                    skipped_notes.append(
                         f"{raga}/{performer}: skipped {skipped} annotations "
                         "outside the seven svaras"
                     )
@@ -220,118 +216,97 @@ def main() -> None:
                 "boundaries": stored["boundaries"].to(torch.bool),
             }
 
-            source = data_dir / "audio" / raga / f"{performer}.mp3"
-            audio_cache = cache_dir / "audio" / raga / f"{performer}.pt"
-            if audio_cache.exists():
-                features = torch.load(audio_cache, map_location="cpu", weights_only=True)
-            else:
-                console.print(f"extracting audio features from {source}")
-                signal, _ = librosa.load(
-                    source, sr=args.sample_rate, mono=True
-                )
-                magnitude = np.abs(
-                    librosa.stft(
-                        signal,
-                        n_fft=args.fft_size,
-                        hop_length=hop,
-                        win_length=args.fft_size,
-                        window=np.hanning(args.fft_size),
-                        center=False,
-                    )
-                ).T
-                features = torch.from_numpy(
-                    np.log(magnitude @ mel_filters + args.log_epsilon).astype(np.float32)
-                )
-                audio_cache.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(features, audio_cache)
-
-            num_frames = len(item["times"])
-            if features.shape[0] >= num_frames:
-                item["audio"] = features[:num_frames]
-            else:
-                padding = features[-1:].expand(num_frames - features.shape[0], -1)
-                item["audio"] = torch.cat([features, padding], dim=0)
             performances.append(item)
+            progress.advance(task)
 
+    progress.stop()
+    for message in skipped_notes:
+        console.print(message)
     console.print(f"{len(performances)} performances across {len(RAGAS)} ragas")
-
-    train = []
-    for raga in RAGAS:
-        subset = [p for p in performances if p["raga"] == raga]
-        test_performer = TEST_PERFORMERS[raga]
-        train.extend(p for p in subset if p["performer"] != test_performer)
-    console.print(f"{len(train)} training performances")
-
-    mask_rng = np.random.default_rng(args.seed)
-    masks = []
-    for performance in train:
-        frames = len(performance["targets"])
-        mask = torch.zeros(frames, dtype=torch.bool)
-        count = int(round(frames * args.val_fraction))
-        index = torch.from_numpy(mask_rng.choice(frames, size=count, replace=False))
-        mask[index] = True
-        masks.append(mask)
-
-    model = TranscriptionModel(
-        num_classes,
-        embed_dim=model_cfg["embed_dim"],
-        depth=model_cfg["depth"],
-        tcn_filters=model_cfg["tcn_filters"],
-        tcn_kernel=model_cfg["tcn_kernel"],
-        tcn_dilations=model_cfg["tcn_dilations"],
-        dropout=model_cfg["dropout"],
-        segmenter_depth=model_cfg["segmenter_depth"],
-        boundary_std=model_cfg["boundary_std"],
-        boundary_threshold=model_cfg["boundary_threshold"],
-        boundary_radius=model_cfg["boundary_radius"],
-        d3pm_steps=model_cfg["d3pm_steps"],
-    ).to(device)
 
     console.print("\n[bold]Model[/bold]")
     encoder_checkpoint = weights_dir / "rise" / "rise_pretrained.pth"
+    audio_checkpoint = weights_dir / "tcn" / "tcn_carnatic_pretrained.pth"
+    if not audio_checkpoint.exists():
+        raise FileNotFoundError(audio_checkpoint)
     if encoder_checkpoint.exists():
-        model.load_pretrained_encoder(encoder_checkpoint, device)
         console.print(f"Loaded RISE encoder weights from {encoder_checkpoint}")
     else:
         console.print(
             f"[yellow]warning:[/yellow] missing pretrained encoder at "
             f"{encoder_checkpoint}; training from scratch"
         )
-    audio_checkpoint = weights_dir / "tcn" / "tcn_carnatic_pretrained.pth"
-    if not audio_checkpoint.exists():
-        raise FileNotFoundError(audio_checkpoint)
-    model.load_pretrained_audio_encoder(audio_checkpoint, device)
     console.print(f"Loaded frozen TCN-carnatic audio encoder from {audio_checkpoint}")
-    model.apply_lora(
-        model_cfg["lora_rank"], model_cfg["lora_alpha"], model_cfg["lora_dropout"]
-    )
-    console.print(f"{model.num_trainable_parameters:,} trainable parameters")
 
-    run_dir = weights_dir / "runs"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    console.print("\n[bold]Stage 1:[/bold] svara classifier with context")
-    classifier_best, classifier_scores = train_classifier(
-        model, train, masks, num_classes, args, device, run_dir=run_dir
-    )
-    console.print(f"Best validation svara F {classifier_best:.4f}")
+    console.print("\n[bold]Training[/bold]")
+    summary = Table(title="Raga finetuning")
+    summary.add_column("raga")
+    summary.add_column("train performances")
+    summary.add_column("best val F")
+    for raga in RAGAS:
+        training = [
+            performance
+            for performance in performances
+            if performance["raga"] == raga
+            and performance["performer"] != TEST_PERFORMERS[raga]
+        ]
+        mask_rng = np.random.default_rng(args.seed)
+        masks = []
+        for performance in training:
+            frames = len(performance["targets"])
+            mask = torch.zeros(frames, dtype=torch.bool)
+            count = int(round(frames * args.val_fraction))
+            index = torch.from_numpy(mask_rng.choice(frames, size=count, replace=False))
+            mask[index] = True
+            masks.append(mask)
 
-    console.print("\n[bold]Stage 2:[/bold] GAME segmenter with fused TCN-carnatic audio embeddings")
-    segmenter_best, segmenter_scores = train_segmenter(
-        model, train, masks, args, device, run_dir=run_dir
-    )
-    console.print(f"Best validation boundary F {segmenter_best:.4f}")
-
-    for name, scores in (("classifier", classifier_scores), ("segmenter", segmenter_scores)):
-        if not scores:
-            continue
-        figure_path = results_dir / f"{name}_history.png"
-        save_history_plot(scores, figure_path)
-        console.print(f"figure written to {figure_path}")
+        model = TranscriptionModel(
+            num_classes,
+            embed_dim=model_cfg["embed_dim"],
+            depth=model_cfg["depth"],
+            tcn_filters=model_cfg["tcn_filters"],
+            tcn_kernel=model_cfg["tcn_kernel"],
+            tcn_dilations=model_cfg["tcn_dilations"],
+            dropout=model_cfg["dropout"],
+            segmenter_depth=model_cfg["segmenter_depth"],
+            boundary_std=model_cfg["boundary_std"],
+            boundary_threshold=model_cfg["boundary_threshold"],
+            boundary_radius=model_cfg["boundary_radius"],
+            d3pm_steps=model_cfg["d3pm_steps"],
+        ).to(device)
+        if encoder_checkpoint.exists():
+            model.load_pretrained_encoder(encoder_checkpoint, device)
+        model.load_pretrained_audio_encoder(audio_checkpoint, device)
+        model.apply_lora(
+            model_cfg["lora_rank"], model_cfg["lora_alpha"], model_cfg["lora_dropout"]
+        )
+        console.print(
+            f"\n[bold]{raga}[/bold] · {len(training)} training performances · "
+            f"{model.num_trainable_parameters:,} trainable parameters"
+        )
+        best, scores = train(
+            model,
+            raga,
+            training,
+            masks,
+            num_classes,
+            args,
+            device,
+            checkpoint_dir=weights_dir / "tsvara" / raga,
+            resume_dir=root / ".cache" / "tsvara" / raga,
+        )
+        summary.add_row(raga, str(len(training)), f"{best:.4f}")
+        if scores:
+            figure_path = results_dir / f"classifier_history_{raga}.png"
+            save_history_plot(scores, figure_path)
+            console.print(f"figure written to {figure_path}")
+    console.print(summary)
 
 
 def parse_args() -> Namespace:
-    parser = ArgumentParser(description="Train the tsvara transcription model in two stages")
+    parser = ArgumentParser(description="Finetune the RISE encoder and the svara classifier")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -339,33 +314,26 @@ def parse_args() -> Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--lr-heads", type=float, default=0.001)
     parser.add_argument("--lr-encoder", type=float, default=0.0001)
-    parser.add_argument("--lr-segmenter", type=float, default=0.001)
     parser.add_argument("--weight-decay", type=float, default=0.0001)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--crops-per-epoch", type=int, default=2000)
     parser.add_argument("--validation-crops", type=int, default=300)
-    parser.add_argument("--sample-rate", type=int, default=44100)
-    parser.add_argument("--audio-fps", type=int, default=100)
-    parser.add_argument("--fft-size", type=int, default=2048)
-    parser.add_argument("--hop-size", type=int, default=None)
-    parser.add_argument("--filter-fmin", type=float, default=30.0)
-    parser.add_argument("--filter-fmax", type=float, default=17000.0)
-    parser.add_argument("--filter-bands", type=int, default=81)
-    parser.add_argument("--log-epsilon", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
 
-def train_classifier(
+def train(
     model: TranscriptionModel,
+    raga: str,
     performances: list[dict],
     masks: list[torch.Tensor],
     num_classes: int,
     args,
     device: torch.device,
     *,
-    run_dir: Path,
+    checkpoint_dir: Path,
+    resume_dir: Path,
 ) -> tuple[float, list[float]]:
     for name, parameter in model.named_parameters():
         parameter.requires_grad = name.startswith(("encoder.", "embedding.", "classifier."))
@@ -410,8 +378,8 @@ def train_classifier(
         if frames <= args.chunk:
             cover.append((which, 0))
 
-    resume = run_dir / "resume_classifier.pt"
-    checkpoint = run_dir / "classifier.pth"
+    resume = resume_dir / "resume.pt"
+    checkpoint = checkpoint_dir / "best.pth"
     state: dict[str, object] = {
         "epoch": 0,
         "best_score": -np.inf,
@@ -425,12 +393,14 @@ def train_classifier(
             stored = torch.load(resume, map_location="cpu", weights_only=False)
         except (RuntimeError, EOFError, OSError):
             stored = None
-            console.print(f"[yellow]Ignoring a corrupt resume record at {resume}[/yellow]")
+            console.print(
+                f"[yellow]Ignoring a corrupt resume record for {raga} at {resume}[/yellow]"
+            )
         if stored is not None:
             state.update({key: value for key, value in stored.items() if key in state})
     if state["stopped"] or state["epoch"] >= args.epochs:
         console.print(
-            f"Already trained for {state['epoch']} epochs; "
+            f"{raga} already trained for {state['epoch']} epochs; "
             f"best validation score {state['best_score']:.4f}"
         )
         return float(state["best_score"]), []
@@ -440,14 +410,14 @@ def train_classifier(
         model.load_state_dict(state["model"])
         optimiser.load_state_dict(state["optimiser"])
         console.print(
-            f"Resuming at epoch {start_epoch} with best validation score "
+            f"{raga} resuming at epoch {start_epoch} with best validation score "
             f"{state['best_score']:.4f}"
         )
     else:
         if start_epoch:
             console.print(
-                "The interrupted weights were not saved; restarting this run "
-                "from its first epoch"
+                f"{raga}: the interrupted weights were not saved; restarting "
+                "this run from its first epoch"
             )
         start_epoch = 0
 
@@ -476,9 +446,7 @@ def train_classifier(
             for offset in range(0, len(specs), args.batch_size):
                 batch_specs = specs[offset : offset + args.batch_size]
                 batch = len(batch_specs)
-                audio_dim = int(performances[0]["audio"].shape[1])
                 inputs = torch.zeros(batch, 2, args.chunk, dtype=torch.float32)
-                audio = torch.zeros(batch, args.chunk, audio_dim, dtype=torch.float32)
                 targets = torch.zeros(batch, args.chunk, dtype=torch.int64)
                 boundaries = torch.zeros(batch, args.chunk, dtype=torch.bool)
                 for row, (which, start) in enumerate(batch_specs):
@@ -487,7 +455,6 @@ def train_classifier(
                     real = contour.shape[0]
                     inputs[row, 0, :real] = contour
                     inputs[row, 1, :real] = performances[which]["voicing"][start:stop]
-                    audio[row, :real] = performances[which]["audio"][start:stop]
                     targets[row, :real] = performances[which]["targets"][start:stop]
                     boundaries[row, :real] = performances[which]["boundaries"][start:stop]
 
@@ -509,9 +476,9 @@ def train_classifier(
                 loss.backward()
                 optimiser.step()
 
-            score = validate_classifier(model, performances, cover, masks, args, device)
+            score = validate(model, performances, cover, masks, args, device)
             scores.append(float(score))
-            console.print(f"classifier epoch {epoch + 1}/{args.epochs} · val {score:.4f}")
+            console.print(f"{raga} · epoch {epoch + 1}/{args.epochs} · val {score:.4f}")
 
             if score > best:
                 best = score
@@ -539,7 +506,8 @@ def train_classifier(
 
             if stopped:
                 console.print(
-                    f"Early stopping after {args.patience} epochs without improvement"
+                    f"{raga} early stopping after {args.patience} epochs "
+                    "without improvement"
                 )
                 break
     except KeyboardInterrupt:
@@ -557,191 +525,16 @@ def train_classifier(
         staged = resume.with_suffix(".tmp")
         torch.save(state, staged)
         staged.replace(resume)
-        console.print(f"Saved the training state of {resume.name} at epoch {epoch}")
-        raise
-
-    return best, scores
-
-
-def train_segmenter(
-    model: TranscriptionModel,
-    performances: list[dict],
-    masks: list[torch.Tensor],
-    args,
-    device: torch.device,
-    *,
-    run_dir: Path,
-) -> tuple[float, list[float]]:
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad = name.startswith("segmenter.")
-    optimiser = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr_segmenter,
-        weight_decay=args.weight_decay,
-    )
-
-    cover = []
-    stride = max(int(args.chunk * 0.5), 1)
-    for which, performance in enumerate(performances):
-        frames = len(performance["targets"])
-        for start in range(0, max(frames - args.chunk, 0) + 1, stride):
-            cover.append((which, start))
-        if frames <= args.chunk:
-            cover.append((which, 0))
-
-    resume = run_dir / "resume_segmenter.pt"
-    checkpoint = run_dir / "best.pth"
-    state: dict[str, object] = {
-        "epoch": 0,
-        "best_score": -np.inf,
-        "epochs_without_improvement": 0,
-        "stopped": False,
-        "model": None,
-        "optimiser": None,
-    }
-    if resume.exists():
-        try:
-            stored = torch.load(resume, map_location="cpu", weights_only=False)
-        except (RuntimeError, EOFError, OSError):
-            stored = None
-            console.print(f"[yellow]Ignoring a corrupt resume record at {resume}[/yellow]")
-        if stored is not None:
-            state.update({key: value for key, value in stored.items() if key in state})
-    if state["stopped"] or state["epoch"] >= args.epochs:
         console.print(
-            f"Already trained for {state['epoch']} epochs; "
-            f"best validation score {state['best_score']:.4f}"
+            f"Saved the training state of {resume.name} for {raga} at epoch {epoch}"
         )
-        return float(state["best_score"]), []
-
-    start_epoch = int(state["epoch"])
-    if start_epoch and state["model"] is not None and state["optimiser"] is not None:
-        model.load_state_dict(state["model"])
-        optimiser.load_state_dict(state["optimiser"])
-        console.print(
-            f"Resuming at epoch {start_epoch} with best validation score "
-            f"{state['best_score']:.4f}"
-        )
-    else:
-        if start_epoch:
-            console.print(
-                "The interrupted weights were not saved; restarting this run "
-                "from its first epoch"
-            )
-        start_epoch = 0
-        initial_weights = run_dir / "classifier.pth"
-        if initial_weights.exists():
-            model.load_state_dict(
-                torch.load(initial_weights, map_location=device, weights_only=True)
-            )
-            console.print(f"Loaded stage 1 weights from {initial_weights}")
-
-    crop_rng = np.random.default_rng(args.seed)
-    best = float(state["best_score"])
-    stale = int(state["epochs_without_improvement"])
-    epoch = start_epoch
-    scores: list[float] = []
-
-    try:
-        for epoch in range(start_epoch, args.epochs):
-            model.train()
-
-            lengths = np.array(
-                [max(len(p["targets"]) - args.chunk, 1) for p in performances], dtype=float
-            )
-            lengths = lengths / lengths.sum()
-            specs = []
-            for _ in range(args.crops_per_epoch):
-                which = int(crop_rng.choice(len(performances), p=lengths))
-                frames = len(performances[which]["targets"])
-                start = int(crop_rng.integers(0, max(frames - args.chunk, 1)))
-                specs.append((which, start))
-
-            for offset in range(0, len(specs), args.batch_size):
-                batch_specs = specs[offset : offset + args.batch_size]
-                batch = len(batch_specs)
-                audio_dim = int(performances[0]["audio"].shape[1])
-                inputs = torch.zeros(batch, 2, args.chunk, dtype=torch.float32)
-                audio = torch.zeros(batch, args.chunk, audio_dim, dtype=torch.float32)
-                boundaries = torch.zeros(batch, args.chunk, dtype=torch.bool)
-                mask = torch.zeros(batch, args.chunk, dtype=torch.bool)
-                for row, (which, start) in enumerate(batch_specs):
-                    stop = start + args.chunk
-                    contour = performances[which]["contour"][start:stop]
-                    real = contour.shape[0]
-                    inputs[row, 0, :real] = contour
-                    inputs[row, 1, :real] = performances[which]["voicing"][start:stop]
-                    audio[row, :real] = performances[which]["audio"][start:stop]
-                    boundaries[row, :real] = performances[which]["boundaries"][start:stop]
-                    mask[row, :real] = True
-
-                outputs = model.segmenter_outputs(
-                    inputs.to(device), audio.to(device), boundaries.to(device)
-                )
-                loss = model.boundary_loss(
-                    outputs["boundary_logits"], boundaries.to(device), mask.to(device)
-                )
-
-                optimiser.zero_grad()
-                loss.backward()
-                optimiser.step()
-
-            score = validate_segmenter(model, performances, cover, masks, args, device)
-            scores.append(float(score))
-            console.print(f"segmenter epoch {epoch + 1}/{args.epochs} · val {score:.4f}")
-
-            if score > best:
-                best = score
-                stale = 0
-                checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), checkpoint)
-            else:
-                stale += 1
-
-            stopped = stale >= args.patience
-            state.update(
-                {
-                    "epoch": epoch + 1,
-                    "best_score": best,
-                    "epochs_without_improvement": stale,
-                    "stopped": stopped,
-                    "model": None,
-                    "optimiser": None,
-                }
-            )
-            resume.parent.mkdir(parents=True, exist_ok=True)
-            staged = resume.with_suffix(".tmp")
-            torch.save(state, staged)
-            staged.replace(resume)
-
-            if stopped:
-                console.print(
-                    f"Early stopping after {args.patience} epochs without improvement"
-                )
-                break
-    except KeyboardInterrupt:
-        state.update(
-            {
-                "epoch": epoch,
-                "best_score": best,
-                "epochs_without_improvement": stale,
-                "stopped": False,
-                "model": model.state_dict(),
-                "optimiser": optimiser.state_dict(),
-            }
-        )
-        resume.parent.mkdir(parents=True, exist_ok=True)
-        staged = resume.with_suffix(".tmp")
-        torch.save(state, staged)
-        staged.replace(resume)
-        console.print(f"Saved the training state of {resume.name} at epoch {epoch}")
         raise
 
     return best, scores
 
 
 @torch.no_grad()
-def validate_classifier(
+def validate(
     model: TranscriptionModel,
     performances: list[dict],
     cover: list[tuple[int, int]],
@@ -762,17 +555,13 @@ def validate_classifier(
         contour = performance["contour"][start:stop]
         real = contour.shape[0]
         inputs = torch.zeros(1, 2, args.chunk, dtype=torch.float32)
-        audio = torch.zeros(1, args.chunk, performance["audio"].shape[1], dtype=torch.float32)
         targets = torch.zeros(1, args.chunk, dtype=torch.int64)
         boundaries = torch.zeros(1, args.chunk, dtype=torch.bool)
-        mask = torch.zeros(1, args.chunk, dtype=torch.bool)
         validation = torch.zeros(1, args.chunk, dtype=torch.bool)
         inputs[0, 0, :real] = contour
         inputs[0, 1, :real] = performance["voicing"][start:stop]
-        audio[0, :real] = performance["audio"][start:stop]
         targets[0, :real] = performance["targets"][start:stop]
         boundaries[0, :real] = performance["boundaries"][start:stop]
-        mask[0, :real] = True
         validation[0, :real] = masks[which][start:stop]
 
         frame_mask = validation[0]
@@ -783,7 +572,7 @@ def validate_classifier(
             targets.to(device),
             boundaries.to(device),
         )
-        labels = outputs["region_logits"].argmax(dim=-1)[outputs["regions"] - 1]
+        labels = outputs["region_logits"].argmax(dim=-1).gather(1, outputs["regions"] - 1)
         truth.append(targets[0][frame_mask])
         predicted.append(labels[0][frame_mask].cpu())
 
@@ -796,59 +585,6 @@ def validate_classifier(
             torch.cat(truth).numpy(),
             torch.cat(predicted).numpy(),
             average="macro",
-            zero_division=0.0,
-        )
-    )
-
-
-@torch.no_grad()
-def validate_segmenter(
-    model: TranscriptionModel,
-    performances: list[dict],
-    cover: list[tuple[int, int]],
-    masks: list[torch.Tensor],
-    args,
-    device: torch.device,
-) -> float:
-    was_training = model.training
-    model.eval()
-    step = max(len(cover) // args.validation_crops, 1)
-    truth: list[np.ndarray] = []
-    predicted: list[np.ndarray] = []
-
-    for index in range(0, len(cover), step):
-        which, start = cover[index]
-        stop = start + args.chunk
-        performance = performances[which]
-        contour = performance["contour"][start:stop]
-        real = contour.shape[0]
-        inputs = torch.zeros(1, 2, args.chunk, dtype=torch.float32)
-        audio = torch.zeros(1, args.chunk, performance["audio"].shape[1], dtype=torch.float32)
-        boundaries = torch.zeros(1, args.chunk, dtype=torch.bool)
-        mask = torch.zeros(1, args.chunk, dtype=torch.bool)
-        validation = torch.zeros(1, args.chunk, dtype=torch.bool)
-        inputs[0, 0, :real] = contour
-        inputs[0, 1, :real] = performance["voicing"][start:stop]
-        audio[0, :real] = performance["audio"][start:stop]
-        boundaries[0, :real] = performance["boundaries"][start:stop]
-        mask[0, :real] = True
-        validation[0, :real] = masks[which][start:stop]
-
-        frame_mask = validation[0]
-        if not frame_mask.any():
-            continue
-        outputs = model.transcribe(inputs.to(device), audio.to(device))
-        truth.append(boundaries[0][frame_mask].numpy())
-        predicted.append(outputs["boundaries"][0][frame_mask].cpu().numpy())
-
-    if was_training:
-        model.train()
-    if not truth:
-        return 0.0
-    return float(
-        f1_score(
-            np.concatenate(truth),
-            np.concatenate(predicted),
             zero_division=0.0,
         )
     )

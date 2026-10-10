@@ -19,6 +19,7 @@ keywords = [
 ]
 
 dependencies = [
+    "einops>=0.7",
     "Levenshtein>=0.21",
     "librosa>=0.10",
     "matplotlib>=3.8",
@@ -27,6 +28,7 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.0",
     "peft>=0.14",
+    "pydantic>=2.0",
     "PyYAML>=6.0",
     "rich>=13.0",
     "scikit-learn>=1.5",

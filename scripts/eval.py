@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
@@ -14,15 +15,14 @@ import pandas as pd
 import torch
 import yaml
 from rich.console import Console
+from rich.progress import Progress
+from rich.table import Table
 from sklearn.metrics import confusion_matrix, f1_score
 
-from game import (
-    boundaries_to_regions,
-    decode_soft_boundaries,
-    d3pm_time_schedule,
-    first_frame_index,
-    remove_boundaries,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "GAME"))
+
+from inference.me_infer import SegmentationEstimationInferenceModel
+from lib.config.schema import InferenceConfig, ModelConfig
 from plots import plot_alignment, plot_confusion
 from tsvara.transcription import TranscriptionModel
 
@@ -77,6 +77,9 @@ def main() -> None:
     num_classes = len(SVARAS) + 1
 
     console.print("[bold]tsvara eval[/bold]")
+    table = Table()
+    table.add_column("option")
+    table.add_column("value")
     for key, value in {
         "min note frames": args.min_note_frames,
         "inference chunk": args.inference_chunk,
@@ -90,10 +93,12 @@ def main() -> None:
         "filter fmax": args.filter_fmax,
         "filter bands": args.filter_bands,
         "log epsilon": args.log_epsilon,
+        "postprocess window": args.postprocess_window,
         "seed": args.seed,
         "device": device,
     }.items():
-        console.print(f"    {key}: {value}")
+        table.add_row(key, str(value))
+    console.print(table)
 
     hop = args.hop_size if args.hop_size else args.sample_rate // args.audio_fps
     mel_filters = librosa.filters.mel(
@@ -105,9 +110,13 @@ def main() -> None:
     ).T
 
     console.print("\n[bold]Data[/bold]")
+    progress = Progress()
+    task = progress.add_task("data", total=len(RAGAS))
+    progress.start()
     test = []
     for raga in RAGAS:
         performer = TEST_PERFORMERS[raga]
+        progress.update(task, description=f"{raga}/{performer}")
         frames_cache = cache_dir / "frames" / raga / f"{performer}.pt"
         if not frames_cache.exists():
             raise FileNotFoundError(frames_cache)
@@ -121,12 +130,11 @@ def main() -> None:
         }
 
         source = data_dir / "audio" / raga / f"{performer}.mp3"
+        signal, _ = librosa.load(source, sr=args.sample_rate, mono=True)
         audio_cache = cache_dir / "audio" / raga / f"{performer}.pt"
         if audio_cache.exists():
             features = torch.load(audio_cache, map_location="cpu", weights_only=True)
         else:
-            console.print(f"extracting audio features from {source}")
-            signal, _ = librosa.load(source, sr=args.sample_rate, mono=True)
             magnitude = np.abs(
                 librosa.stft(
                     signal,
@@ -143,6 +151,8 @@ def main() -> None:
             audio_cache.parent.mkdir(parents=True, exist_ok=True)
             torch.save(features, audio_cache)
 
+        item["waveform"] = torch.from_numpy(signal)
+        item["sample_rate"] = args.sample_rate
         num_frames = len(item["times"])
         if features.shape[0] >= num_frames:
             item["audio"] = features[:num_frames]
@@ -150,6 +160,9 @@ def main() -> None:
             padding = features[-1:].expand(num_frames - features.shape[0], -1)
             item["audio"] = torch.cat([features, padding], dim=0)
         test.append(item)
+        progress.advance(task)
+
+    progress.stop()
     console.print(f"{len(test)} held-out test performances")
 
     model = TranscriptionModel(
@@ -168,31 +181,69 @@ def main() -> None:
     ).to(device)
 
     console.print("\n[bold]Model[/bold]")
-    checkpoint = weights_dir / "runs" / "best.pth"
-    if not checkpoint.exists():
-        raise FileNotFoundError(checkpoint)
-    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     model.apply_lora(
         model_cfg["lora_rank"], model_cfg["lora_alpha"], model_cfg["lora_dropout"]
     )
-    console.print(f"Loaded fine-tuned weights from {checkpoint}")
+    checkpoints = {}
+    for raga in RAGAS:
+        path = weights_dir / "tsvara" / raga / "best.pth"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        checkpoints[raga] = path
+        console.print(f"Fine-tuned weights for {raga}: {path}")
+
+    console.print("\n[bold]Game[/bold]")
+    game_config = yaml.safe_load(
+        (weights_dir / "game" / "game_pretrained_config.yaml").read_text()
+    )
+    game_model_config = ModelConfig.model_validate(game_config["model"], scope=0)
+    game_inference_config = InferenceConfig.model_validate(
+        game_config["inference"], scope=0
+    )
+    game_model_config.check(scope_mask=0)
+    game_inference_config.check(scope_mask=0)
+    game_model = SegmentationEstimationInferenceModel(
+        game_model_config, game_inference_config
+    )
+    game_checkpoint = weights_dir / "game" / "game_pretrained.pt"
+    game_state = torch.load(game_checkpoint, map_location="cpu", weights_only=True)
+    game_model.load_state_dict(game_state["state_dict"], strict=True)
+    game_model.eval()
+    game_model.to(device)
+    console.print(f"Loaded frozen GAME from {game_checkpoint}")
 
     console.print("\n[bold]Evaluation[/bold]")
-    rows = []
-    aggregated = {}
-    confusion_total = np.zeros((len(SVARAS), len(SVARAS)), dtype=np.int64)
-    alignment_rows = []
+    progress = Progress()
+    task = progress.add_task("evaluation", total=len(test))
+    progress.start()
+    conditions = ("without TCN postprocessing", "with TCN postprocessing")
+    rows = {condition: [] for condition in conditions}
+    aggregated = {condition: {} for condition in conditions}
+    confusion_total = {
+        condition: {
+            raga: np.zeros((len(SVARAS), len(SVARAS)), dtype=np.int64)
+            for raga in RAGAS
+        }
+        for condition in conditions
+    }
+    alignment_rows = {raga: [] for raga in RAGAS}
     for performance in test:
         raga = performance["raga"]
         performer = performance["performer"]
+        progress.update(task, description=f"{raga}/{performer}")
+        model.load_state_dict(
+            torch.load(checkpoints[raga], map_location=device, weights_only=True)
+        )
         times = performance["times"].numpy()
-        estimated = transcribe(
+        estimated, estimated_post = transcribe(
             model,
+            game_model,
             performance,
             device,
             args.inference_chunk,
             args.inference_overlap,
             args.min_note_frames,
+            args.postprocess_window,
         )
 
         annotations = pd.read_csv(
@@ -222,112 +273,195 @@ def main() -> None:
         ref_intervals = np.array(
             sorted([[note[0], note[1]] for note in reference]), dtype=float
         ).reshape(-1, 2)
-        est_intervals = np.array(
-            sorted([[note[0], note[1]] for note in estimated]), dtype=float
-        ).reshape(-1, 2)
         ref_onsets = ref_intervals[:, 0] if len(ref_intervals) else np.zeros(0)
-        est_onsets = est_intervals[:, 0] if len(est_intervals) else np.zeros(0)
 
-        if len(ref_intervals) and len(est_intervals):
-            onset_p, onset_r, onset_f, _ = mir_eval.transcription.onset_precision_recall_f1(
-                ref_intervals, est_intervals, args.match_window
+        for condition, notes in zip(conditions, (estimated, estimated_post), strict=True):
+            est_intervals = np.array(
+                sorted([[note[0], note[1]] for note in notes]), dtype=float
+            ).reshape(-1, 2)
+            est_onsets = est_intervals[:, 0] if len(est_intervals) else np.zeros(0)
+
+            if len(ref_intervals) and len(est_intervals):
+                onset_p, onset_r, onset_f, _ = mir_eval.transcription.onset_precision_recall_f1(
+                    ref_intervals, est_intervals, args.match_window
+                )
+                offset_p, offset_r, offset_f, _ = mir_eval.transcription.offset_precision_recall_f1(
+                    ref_intervals, est_intervals
+                )
+                boundary_p, boundary_r, boundary_f = mir_eval.segment.detection(
+                    ref_intervals, est_intervals, args.match_window
+                )
+                pairs = mir_eval.util.match_events(ref_onsets, est_onsets, args.match_window)
+            else:
+                onset_p = onset_r = onset_f = 0.0
+                offset_p = offset_r = offset_f = 0.0
+                boundary_p = boundary_r = boundary_f = 0.0
+                pairs = []
+
+            y_true = [SVARAS.index(reference[i][2]) for i, _ in pairs]
+            y_pred = [SVARAS.index(notes[j][2]) for _, j in pairs]
+            svara_f = (
+                f1_score(y_true, y_pred, labels=range(len(SVARAS)), average="macro", zero_division=0.0)
+                if pairs
+                else 0.0
             )
-            offset_p, offset_r, offset_f, _ = mir_eval.transcription.offset_precision_recall_f1(
-                ref_intervals, est_intervals
+            label_accuracy = (
+                float(np.mean(np.array(y_true) == np.array(y_pred))) if pairs else 0.0
             )
-            boundary_p, boundary_r, boundary_f = mir_eval.segment.detection(
-                ref_intervals, est_intervals, args.match_window
+            confusion_total[condition][raga] += confusion_matrix(
+                y_true, y_pred, labels=range(len(SVARAS))
             )
-            pairs = mir_eval.util.match_events(ref_onsets, est_onsets, args.match_window)
-        else:
-            onset_p = onset_r = onset_f = 0.0
-            offset_p = offset_r = offset_f = 0.0
-            boundary_p = boundary_r = boundary_f = 0.0
-            pairs = []
 
-        y_true = [SVARAS.index(reference[i][2]) for i, _ in pairs]
-        y_pred = [SVARAS.index(estimated[j][2]) for _, j in pairs]
-        svara_f = (
-            f1_score(y_true, y_pred, labels=range(len(SVARAS)), average="macro", zero_division=0.0)
-            if pairs
-            else 0.0
-        )
-        label_accuracy = (
-            float(np.mean(np.array(y_true) == np.array(y_pred))) if pairs else 0.0
-        )
-        confusion_total += confusion_matrix(y_true, y_pred, labels=range(len(SVARAS)))
+            ref_labels = "".join(note[2] for note in reference)
+            est_labels = "".join(note[2] for note in notes)
+            distance = Levenshtein.distance(ref_labels, est_labels)
+            accuracy = 1.0 - distance / max(len(ref_labels), len(est_labels), 1)
 
-        ref_labels = "".join(note[2] for note in reference)
-        est_labels = "".join(note[2] for note in estimated)
-        distance = Levenshtein.distance(ref_labels, est_labels)
-        accuracy = 1.0 - distance / max(len(ref_labels), len(est_labels), 1)
-
-        correct_ref = {i for i, j in pairs if reference[i][2] == estimated[j][2]}
-        correct_est = {j for i, j in pairs if reference[i][2] == estimated[j][2]}
-        alignment_rows.append(
-            (
-                f"{raga}/{performer}",
-                [
-                    (note[0], note[1], note[2], index in correct_ref)
-                    for index, note in enumerate(reference)
-                ],
-                [
-                    (note[0], note[1], note[2], index in correct_est)
-                    for index, note in enumerate(estimated)
-                ],
+            metrics = {
+                "onset_precision": float(onset_p),
+                "onset_recall": float(onset_r),
+                "onset_f_measure": float(onset_f),
+                "offset_precision": float(offset_p),
+                "offset_recall": float(offset_r),
+                "offset_f_measure": float(offset_f),
+                "boundary_precision": float(boundary_p),
+                "boundary_recall": float(boundary_r),
+                "boundary_f_measure": float(boundary_f),
+                "svara_f_measure": float(svara_f),
+                "label_accuracy": label_accuracy,
+                "alignment_accuracy": float(accuracy),
+                "num_reference_notes": float(len(reference)),
+                "num_estimated_notes": float(len(notes)),
+            }
+            for key, value in metrics.items():
+                aggregated[condition].setdefault(raga, {}).setdefault(key, []).append(value)
+            rows[condition].append(
+                (
+                    raga,
+                    performer,
+                    f"{boundary_f:.3f}",
+                    f"{onset_f:.3f}",
+                    f"{offset_f:.3f}",
+                    f"{svara_f:.3f}",
+                    f"{label_accuracy:.3f}",
+                    f"{accuracy:.3f}",
+                )
             )
-        )
 
-        metrics = {
-            "onset_precision": float(onset_p),
-            "onset_recall": float(onset_r),
-            "onset_f_measure": float(onset_f),
-            "offset_precision": float(offset_p),
-            "offset_recall": float(offset_r),
-            "offset_f_measure": float(offset_f),
-            "boundary_precision": float(boundary_p),
-            "boundary_recall": float(boundary_r),
-            "boundary_f_measure": float(boundary_f),
-            "svara_f_measure": float(svara_f),
-            "label_accuracy": label_accuracy,
-            "alignment_accuracy": float(accuracy),
-            "num_reference_notes": float(len(reference)),
-            "num_estimated_notes": float(len(estimated)),
+            if condition == conditions[1]:
+                correct_ref = {i for i, j in pairs if reference[i][2] == notes[j][2]}
+                correct_est = {j for i, j in pairs if reference[i][2] == notes[j][2]}
+                alignment_rows[raga].append(
+                    (
+                        f"{raga}/{performer}",
+                        [
+                            (note[0], note[1], note[2], index in correct_ref)
+                            for index, note in enumerate(reference)
+                        ],
+                        [
+                            (note[0], note[1], note[2], index in correct_est)
+                            for index, note in enumerate(notes)
+                        ],
+                    )
+                )
+        progress.advance(task)
+
+    progress.stop()
+
+    headline = (
+        "boundary_f_measure",
+        "onset_f_measure",
+        "offset_f_measure",
+        "svara_f_measure",
+        "label_accuracy",
+        "alignment_accuracy",
+    )
+    means = {}
+    for condition in conditions:
+        means[condition] = {}
+        for raga in RAGAS:
+            means[condition][raga] = {
+                key: float(np.mean(values))
+                for key, values in aggregated[condition][raga].items()
+            }
+        means[condition]["all"] = {
+            key: float(
+                np.mean(
+                    [
+                        value
+                        for raga in RAGAS
+                        for value in aggregated[condition][raga][key]
+                    ]
+                )
+            )
+            for key in means[condition][RAGAS[0]]
         }
-        for key, value in metrics.items():
-            aggregated.setdefault(key, []).append(value)
-        rows.append(
-            (
-                f"{raga}/{performer}",
-                f"{boundary_f:.3f}",
-                f"{onset_f:.3f}",
-                f"{offset_f:.3f}",
-                f"{svara_f:.3f}",
-                f"{label_accuracy:.3f}",
-                f"{accuracy:.3f}",
-            )
-        )
 
-    console.print("Test transcription")
-    console.print("performance\tboundary F\tonset F\toffset F\tsvara F\tlabel acc\talign acc")
-    for row in rows:
-        console.print("\t".join(row))
-    means = {key: float(np.mean(values)) for key, values in aggregated.items()}
-    console.print("\n[bold]Mean[/bold]")
-    for key, value in sorted(means.items()):
-        console.print(f"{key}: {value:.3f}")
+    for condition in conditions:
+        table = Table(title=f"Test transcription ({condition})")
+        for column in (
+            "raga",
+            "performer",
+            "boundary F",
+            "onset F",
+            "offset F",
+            "svara F",
+            "label acc",
+            "align acc",
+        ):
+            table.add_column(column)
+        for row in rows[condition]:
+            table.add_row(*row)
+        console.print(table)
+
+        table = Table(title=f"Mean ({condition})")
+        table.add_column("raga")
+        for column in (
+            "boundary F",
+            "onset F",
+            "offset F",
+            "svara F",
+            "label acc",
+            "align acc",
+        ):
+            table.add_column(column, justify="right")
+        for raga in [*RAGAS, "all"]:
+            values = means[condition][raga]
+            table.add_row(raga, *(f"{values[key]:.3f}" for key in headline))
+        console.print(table)
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results_path = results_dir / "results.json"
-    results_path.write_text(json.dumps({"mean": means, "per_performance": rows}, indent=4))
+    results_path.write_text(
+        json.dumps(
+            {
+                condition: {
+                    "mean": means[condition]["all"],
+                    "per_raga": {
+                        raga: {
+                            "mean": means[condition][raga],
+                            "per_performance": [
+                                row for row in rows[condition] if row[0] == raga
+                            ],
+                        }
+                        for raga in RAGAS
+                    },
+                }
+                for condition in conditions
+            },
+            indent=4,
+        )
+    )
     console.print(f"results written to {results_path}")
 
     metrics_path = results_dir / "metrics.csv"
     pd.DataFrame(
-        rows,
+        [(condition,) + row for condition in conditions for row in rows[condition]],
         columns=[
-            "performance",
+            "condition",
+            "raga",
+            "performer",
             "boundary F",
             "onset F",
             "offset F",
@@ -340,18 +474,29 @@ def main() -> None:
 
     mean_path = results_dir / "mean.csv"
     pd.DataFrame(
-        [{"metric": key.replace("_", " "), "value": value} for key, value in sorted(means.items())]
+        [
+            (condition, raga, key.replace("_", " "), value)
+            for condition in conditions
+            for raga in [*RAGAS, "all"]
+            for key, value in sorted(means[condition][raga].items())
+        ],
+        columns=["condition", "raga", "metric", "value"],
     ).to_csv(mean_path, index=False)
     console.print(f"table written to {mean_path}")
 
-    figure = plot_confusion(confusion_total, list(SVARAS), "Svara confusion")
-    figure_path = results_dir / "confusion.png"
-    figure.savefig(figure_path, dpi=300, bbox_inches="tight")
-    console.print(f"figure written to {figure_path}")
+    for raga in RAGAS:
+        figure = plot_confusion(
+            confusion_total[conditions[1]][raga],
+            list(SVARAS),
+            f"Svara confusion ({raga})",
+        )
+        figure_path = results_dir / f"confusion_{raga}.png"
+        figure.savefig(figure_path, dpi=300, bbox_inches="tight")
+        console.print(f"figure written to {figure_path}")
 
-    alignment_path = results_dir / "alignment.png"
-    plot_alignment(alignment_rows, alignment_path)
-    console.print(f"figure written to {alignment_path}")
+        alignment_path = results_dir / f"alignment_{raga}.png"
+        plot_alignment(alignment_rows[raga], alignment_path)
+        console.print(f"figure written to {alignment_path}")
 
 
 def parse_args() -> Namespace:
@@ -360,6 +505,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--inference-chunk", type=int, default=4096)
     parser.add_argument("--inference-overlap", type=int, default=512)
     parser.add_argument("--match-window", type=float, default=0.05)
+    parser.add_argument("--postprocess-window", type=int, default=5)
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--audio-fps", type=int, default=100)
     parser.add_argument("--fft-size", type=int, default=2048)
@@ -376,12 +522,14 @@ def parse_args() -> Namespace:
 @torch.no_grad()
 def transcribe(
     model: TranscriptionModel,
+    game_model: SegmentationEstimationInferenceModel,
     performance: dict,
     device: torch.device,
     chunk: int,
     overlap: int,
     min_frames: int,
-) -> list[tuple[float, float, str]]:
+    window: int,
+) -> tuple[list[tuple[float, float, str]], list[tuple[float, float, str]]]:
     total = performance["times"].shape[0]
     inputs = np.stack(
         [performance["contour"].numpy(), performance["voicing"].numpy()]
@@ -392,8 +540,8 @@ def transcribe(
 
     for start in range(0, total, stride):
         stop = min(start + chunk, total)
-        window = torch.from_numpy(inputs[:, start:stop]).unsqueeze(0).to(device)
-        features = model.encode(window)[0].cpu().numpy()
+        crop = torch.from_numpy(inputs[:, start:stop]).unsqueeze(0).to(device)
+        features = model.encode(crop)[0].cpu().numpy()
         if embedding is None:
             embedding = np.zeros((features.shape[0], total), dtype=np.float32)
         embedding[:, start:stop] += features
@@ -402,52 +550,87 @@ def transcribe(
             break
     embedding = torch.from_numpy(embedding / counts).unsqueeze(0).to(device)
 
-    audio = performance["audio"].unsqueeze(0).to(device)
     times = performance["times"].numpy()
-    spans = segment(model, embedding, audio, times, min_frames)
-    return classify(model, embedding, spans, times, SVARAS)
+    spans, refined = segment(
+        model, game_model, performance, times, device, min_frames, chunk, overlap, window
+    )
+    notes = classify(model, embedding, spans, times, SVARAS)
+    notes_refined = classify(model, embedding, refined, times, SVARAS)
+    return notes, notes_refined
 
 
 @torch.no_grad()
 def segment(
     model: TranscriptionModel,
-    embedding: torch.Tensor,
-    audio: torch.Tensor,
+    game_model: SegmentationEstimationInferenceModel,
+    performance: dict,
     times: np.ndarray,
+    device: torch.device,
     min_frames: int,
-) -> list[tuple[int, int]]:
-    was_training = model.training
-    model.eval()
-    fused = model.fuse(embedding, model.encode_audio(audio))
-    boundaries = torch.zeros(
-        embedding.shape[0], embedding.shape[2], dtype=torch.bool, device=embedding.device
-    )
-    step = torch.full((1,), 1 / model.d3pm_steps, device=embedding.device)
-    for index in range(model.d3pm_steps):
-        t = index * step.expand(embedding.shape[0])
-        boundaries = remove_boundaries(boundaries, d3pm_time_schedule(t))
-        logits = model.segmenter(fused, boundaries_to_regions(boundaries), t)
-        boundaries = decode_soft_boundaries(
-            logits.sigmoid(),
-            threshold=model.boundary_threshold,
-            radius=model.boundary_radius,
-        )
-    if was_training:
-        model.train()
-
-    regions = boundaries_to_regions(boundaries)[0]
-    first = first_frame_index(regions)
+    chunk: int,
+    overlap: int,
+    window: int,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     frames = len(times)
-    spans = []
-    for region in range(1, int(regions.max()) + 1):
-        start = int(first[region])
-        if start >= frames:
+    step = float(times[1] - times[0]) if frames > 1 else 0.0
+    hop_samples = int(round(performance["sample_rate"] * step))
+    waveform = performance["waveform"]
+    boundary_flags = np.zeros(frames, dtype=bool)
+    stride = max(chunk - overlap, 1)
+    for start in range(0, frames, stride):
+        stop = min(start + chunk, frames)
+        if stop - start < 2:
+            break
+        crop = waveform[start * hop_samples : stop * hop_samples]
+        crop = crop.unsqueeze(0).to(device)
+        duration = torch.tensor(
+            [[crop.shape[1] / performance["sample_rate"]]],
+            dtype=torch.float32,
+            device=device,
+        )
+        durations, _, _ = game_model(
+            crop,
+            duration,
+            0.3,
+            2,
+            0.2,
+            language=torch.zeros(1, dtype=torch.long, device=device),
+            t=torch.arange(8, dtype=torch.float32, device=device) / 8,
+        )
+        ends = np.cumsum(durations[0].detach().cpu().numpy())
+        for value in ends:
+            frame = start + int(round(float(value) / step))
+            if 0 < frame < frames:
+                boundary_flags[frame] = True
+        if stop == frames:
+            break
+
+    bounds = [0] + np.flatnonzero(boundary_flags).tolist() + [frames]
+    spans = [
+        (bounds[index], bounds[index + 1])
+        for index in range(len(bounds) - 1)
+        if bounds[index + 1] - bounds[index] >= min_frames
+    ]
+
+    audio_embedding = model.encode_audio(performance["audio"].unsqueeze(0).to(device))[0]
+    delta = (audio_embedding[:, 1:] - audio_embedding[:, :-1]).norm(dim=0)
+    delta = delta.detach().cpu().numpy()
+    refined = [bounds[0]]
+    for value in bounds[1:-1]:
+        lo = max(value - 1 - window, 0)
+        hi = min(value - 1 + window + 1, len(delta))
+        if hi <= lo:
+            refined.append(value)
             continue
-        stop = int(first[region + 1]) if region + 1 < len(first) else frames
-        if stop - start < min_frames:
-            continue
-        spans.append((start, stop))
-    return spans
+        refined.append(int(np.argmax(delta[lo:hi])) + 1)
+    refined.append(frames)
+    refined = sorted(set(refined))
+    refined_spans = [
+        (refined[index], refined[index + 1])
+        for index in range(len(refined) - 1)
+        if refined[index + 1] - refined[index] >= min_frames
+    ]
+    return spans, refined_spans
 
 
 @torch.no_grad()
