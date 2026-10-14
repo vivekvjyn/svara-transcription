@@ -1,3 +1,4 @@
-[submodule "GAME"]
-	path = GAME
-	url = https://github.com/openvpi/GAME.git
+[submodule "RISE"]
+	path = RISE
+	url = https://github.com/MTG/RISE.git
+	branch = full-thesis

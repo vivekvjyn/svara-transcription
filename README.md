@@ -5,12 +5,11 @@
 ```bash
 git clone https://github.com/vivekvjyn/transvara.git
 cd transvara
-pip install -e .
+pip install -r requirements.txt
 ```
 
 ## Run
 
 ```bash
-python scripts/train.py
-python scripts/eval.py
+python scripts/main.py
 ```
