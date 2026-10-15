@@ -1,35 +1,14 @@
 from __future__ import annotations
 
 import random
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 SVARAS: tuple[str, ...] = ("S", "R", "G", "M", "P", "D", "N")
 NONE_INDEX = len(SVARAS)
 
-
-def voiced_regions(
-    voicing: np.ndarray, min_frames: int = 20, gap_frames: int = 10
-) -> list[tuple[int, int]]:
-    mask = voicing > 0.5
-    runs: list[list[int]] = []
-    start = None
-    for index, value in enumerate(mask):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            runs.append([start, index])
-            start = None
-    if start is not None:
-        runs.append([start, len(mask)])
-    merged: list[list[int]] = []
-    for run in runs:
-        if merged and run[0] - merged[-1][1] <= gap_frames:
-            merged[-1][1] = run[1]
-        else:
-            merged.append(run)
-    return [(begin, end) for begin, end in merged if end - begin >= min_frames]
+EmbedFn = Callable[[list[tuple[int, int]]], np.ndarray]
 
 
 def curvature_peaks(contour: np.ndarray, min_gap: int) -> np.ndarray:
@@ -125,42 +104,23 @@ def crossover(
     return merged
 
 
-def segment_embeddings(
-    prefix: np.ndarray, boundaries: np.ndarray, context: int
-) -> np.ndarray:
-    starts = boundaries[:-1]
-    stops = boundaries[1:]
-    frames = prefix.shape[1] - 1
-
-    def pool(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        lengths = np.maximum(right - left, 1).astype(np.float64)[np.newaxis, :]
-        return ((prefix[:, right] - prefix[:, left]) / lengths).T
-
-    prec_left = np.maximum(starts - context, 0)
-    succ_right = np.minimum(stops + context, frames)
-    current = pool(starts, stops)
-    prec = pool(prec_left, starts)
-    succ = pool(stops, succ_right)
-    return np.concatenate([prec, current, succ], axis=1)
-
-
 def batch_costs(
     population: list[np.ndarray],
-    prefix: np.ndarray,
+    embed_fn: EmbedFn,
     classifier: Any,
     trigram: np.ndarray,
     bigram: np.ndarray,
     unigram: np.ndarray,
     alpha: float,
     beta: float,
-    gamma: float,
-    beat_frames: float,
-    context: int,
 ) -> np.ndarray:
     counts = np.asarray([max(len(boundaries) - 1, 1) for boundaries in population])
-    embeddings = np.concatenate(
-        [segment_embeddings(prefix, boundaries, context) for boundaries in population]
-    )
+    pairs = [
+        pair
+        for member in population
+        for pair in zip(member[:-1].tolist(), member[1:].tolist(), strict=True)
+    ]
+    embeddings = embed_fn(pairs)
     probabilities = classifier.predict_proba(embeddings)
     labels = probabilities.argmax(axis=1)
     confidence = probabilities[np.arange(len(labels)), labels]
@@ -177,15 +137,15 @@ def batch_costs(
             current = segment_labels[2:]
             first = segment_labels[:-2]
             second = segment_labels[1:-1]
-            pairs = bigram[first, second]
+            pairs_counts = bigram[first, second]
             triplets = trigram[first, second, current]
             observed = np.where(
-                pairs > 0, (triplets + 1e-3) / (pairs + 1e-3 * len(SVARAS)), unigram[current]
+                pairs_counts > 0,
+                (triplets + 1e-3) / (pairs_counts + 1e-3 * len(SVARAS)),
+                unigram[current],
             )
             l_trans = float(observed.mean())
-        lengths_beats = np.diff(member) / max(beat_frames, 1.0)
-        l_length = float(np.minimum(lengths_beats, 8.0).mean() / 8.0)
-        costs[index] = alpha * l_svara + beta * l_trans - gamma * l_length
+        costs[index] = (alpha * l_svara + beta * l_trans) / (alpha + beta)
     return costs
 
 
@@ -193,7 +153,7 @@ def optimize_chunk(
     contour: np.ndarray,
     start: int,
     stop: int,
-    prefix: np.ndarray,
+    embed_fn: EmbedFn,
     classifier: Any,
     trigram: np.ndarray,
     bigram: np.ndarray,
@@ -203,9 +163,6 @@ def optimize_chunk(
     smax: int,
     alpha: float,
     beta: float,
-    gamma: float,
-    beat_frames: float,
-    context: int,
     population_size: int,
     iterations: int,
     pm: float,
@@ -221,8 +178,8 @@ def optimize_chunk(
         mutated = mutate(seed.copy(), dmin, dmax, smax, pm, pd, pa, rng)
         population.append(mutated if len(mutated) >= 3 else seed.copy())
     scores = batch_costs(
-        population, prefix, classifier, trigram, bigram, unigram,
-        alpha, beta, gamma, beat_frames, context,
+        population, embed_fn, classifier, trigram, bigram, unigram,
+        alpha, beta,
     )
     for _ in range(iterations):
         order = np.argsort(scores)[::-1]
@@ -241,8 +198,8 @@ def optimize_chunk(
             next_population.append(child)
             next_scores.append(0.0)
         evolved = batch_costs(
-            next_population[1:], prefix, classifier, trigram, bigram, unigram,
-            alpha, beta, gamma, beat_frames, context,
+            next_population[1:], embed_fn, classifier, trigram, bigram, unigram,
+            alpha, beta,
         )
         next_scores[1:] = evolved
         population = next_population
@@ -252,17 +209,15 @@ def optimize_chunk(
 
 def genetic_transcribe(
     contour: np.ndarray,
-    frame_embeddings: np.ndarray,
     regions: list[tuple[int, int]],
+    embed_fn: EmbedFn,
     classifier: Any,
     trigram: np.ndarray,
     bigram: np.ndarray,
     unigram: np.ndarray,
     beat_frames: float,
-    context: int,
     alpha: float,
     beta: float,
-    gamma: float,
     population_size: int,
     iterations: int,
     pm: float,
@@ -271,13 +226,10 @@ def genetic_transcribe(
     pa: float,
     rng: random.Random,
 ) -> list[tuple[int, int, int]]:
-    frames = len(contour)
     dmin = max(int(round(beat_frames * 0.5)), 2)
     dmax = max(int(round(beat_frames * 2.0)), dmin + 1)
     smax = max(int(round(beat_frames)), 1)
     chunk_frames = max(dmax * 6, dmin * 10)
-    prefix = np.zeros((frame_embeddings.shape[1], frames + 1), dtype=np.float64)
-    prefix[:, 1:] = np.cumsum(np.asarray(frame_embeddings, dtype=np.float64), axis=0).T
     notes: list[tuple[int, int, int]] = []
     for region_start, region_stop in regions:
         chunk_start = int(region_start)
@@ -291,7 +243,7 @@ def genetic_transcribe(
                 contour,
                 chunk_start,
                 chunk_stop,
-                prefix,
+                embed_fn,
                 classifier,
                 trigram,
                 bigram,
@@ -301,9 +253,6 @@ def genetic_transcribe(
                 smax,
                 alpha,
                 beta,
-                gamma,
-                beat_frames,
-                context,
                 population_size,
                 iterations,
                 pm,
@@ -313,9 +262,10 @@ def genetic_transcribe(
                 rng,
             )
             if len(boundaries) >= 2:
-                labels = classifier.predict(
-                    segment_embeddings(prefix, boundaries, context)
-                ).astype(np.int64)
+                pairs = list(
+                    zip(boundaries[:-1].tolist(), boundaries[1:].tolist(), strict=True)
+                )
+                labels = classifier.predict(embed_fn(pairs)).astype(np.int64)
                 for index in range(len(labels)):
                     if labels[index] != NONE_INDEX:
                         notes.append(

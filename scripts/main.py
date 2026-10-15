@@ -21,67 +21,30 @@ import yaml
 from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
-from scipy.interpolate import UnivariateSpline
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "RISE" / "src"))
 
-from compiam.utils.dbn import HiddenMarkovModel
-from genetic import SVARAS, genetic_transcribe, segment_embeddings, voiced_regions
-from plots import (
-    plot_alignment,
-    plot_confusion,
-    plot_events,
-    plot_transcription,
+import hmm  # noqa: F401
+from genetic import SVARAS, genetic_transcribe
+from plots import plot_transcription
+from preprocess import (
+    build_frames,
+    coverage_frames,
+    frame_spans_to_seconds,
+    make_encoder,
+    merge_coverage,
+    read_annotations,
+    sample_none_spans,
 )
-from rise.nn.models import SvaraEmbedder
+from rise.data.corpora import RAGA_SVARAS
+from rise.nn.lora import DEFAULT_ALPHA, DEFAULT_DROPOUT, DEFAULT_RANK
+from rise.nn.models import ContextualSvaraClassifier
 
-
-def dbn_viterbi(self, log_densities):
-    num_frames = len(log_densities)
-    if num_frames == 0:
-        return np.empty(0, dtype=np.int64), -np.inf
-    frames = np.asarray(log_densities, dtype=np.float64)
-    pointers = self.observation_pointers
-    previous = np.full(self.num_states, -np.log(self.num_states))
-    current = np.empty(self.num_states)
-    backtrack = np.empty((num_frames, len(self._multi)), dtype=np.int32)
-    has_multi = len(self._multi) > 0
-    for frame in range(num_frames):
-        if self._shift:
-            current[1:] = previous[:-1]
-        else:
-            current[self._single] = (
-                previous[self._single_prev] + self._single_log_prob
-            )
-        if has_multi:
-            candidates = previous[self._multi_prev] + self._multi_log_prob
-            best = candidates.argmax(axis=1)
-            current[self._multi] = candidates[self._multi_rows, best]
-            backtrack[frame] = self._multi_prev[self._multi_rows, best]
-        current += frames[frame, pointers]
-        previous, current = current, previous
-    state = int(np.argmax(previous))
-    log_probability = previous[state]
-    if np.isinf(log_probability):
-        return np.empty(0, dtype=np.int64), log_probability
-    single_lookup = np.zeros(self.num_states, dtype=np.int64)
-    single_lookup[self._single] = self._single_prev
-    path = np.empty(num_frames, dtype=np.int64)
-    for frame in range(num_frames - 1, -1, -1):
-        path[frame] = state
-        multi = self._multi_index[state]
-        state = backtrack[frame, multi] if multi >= 0 else single_lookup[state]
-    return path, log_probability
-
-
-HiddenMarkovModel.viterbi = dbn_viterbi
-
-console = Console()
+console = Console(stderr=True)
 
 RAGAS: tuple[str, ...] = (
     "abhogi",
@@ -93,11 +56,20 @@ RAGAS: tuple[str, ...] = (
     "sri",
 )
 
+TEST_PERFORMER: dict[str, str] = {
+    "abhogi": "vignesh",
+    "begada": "prasanna",
+    "kalyani": "ramakrishnamurthy",
+    "mohanam": "dharini",
+    "sahana": "sreevidya",
+    "saveri": "badrinarayanan",
+    "sri": "vignesh",
+}
+
 PLOT_SECONDS = 15.0
 EMBED_DIM = 48
 EMBED_DEPTH = 5
-EMBED_CHUNK_FRAMES = 8192
-EMBED_CONTEXT = 50
+CONTEXT_DIM = EMBED_DIM * 3
 
 
 def main() -> None:
@@ -127,15 +99,15 @@ def main() -> None:
     table.add_column("option")
     table.add_column("value")
     for key, value in {
-        "cost": "alpha * Lsvara + beta * Ltrans - gamma * Llength",
+        "cost": "L = (alpha * Lsvara + beta * Ltrans) / (alpha + beta)",
         "alpha": args.alpha,
         "beta": args.beta,
-        "gamma (short note bias)": args.gamma,
         "pm / pc / pd / pa": f"{args.pm} / {args.pc} / {args.pd} / {args.pa}",
         "ga population": args.ga_population,
         "ga iterations": args.ga_iterations,
         "dmin / dmax / smax": "half beat / two beats / one beat (TCN)",
-        "match window": args.match_window,
+        "model": "RISE fine-tuned contextual classifier (0.5 s melodic context)",
+        "match window": "half beat (paper)",
         "sample rate": args.sample_rate,
         "seed": args.seed,
         "device": device,
@@ -146,7 +118,7 @@ def main() -> None:
     console.print("\n[bold]Data[/bold]")
     tonics = yaml.safe_load((data_dir / "tonics.yaml").read_text())
 
-    progress = Progress()
+    progress = Progress(console=console)
     task = progress.add_task(
         "data",
         total=sum(
@@ -173,19 +145,23 @@ def main() -> None:
                     "performer": performer,
                     "times": stored["times"],
                     "contour": stored["contour"].to(torch.float32),
-                    "voicing": stored["voicing"].to(torch.float32),
                 }
             )
             progress.advance(task)
 
     progress.stop()
     console.print(f"{len(performances)} performances")
-
-    console.print("\n[bold]Non-silent regions[/bold]")
+    available = {raga: set() for raga in RAGAS}
     for performance in performances:
-        performance["regions"] = voiced_regions(performance["voicing"].numpy())
+        available[performance["raga"]].add(performance["performer"])
+    for raga in RAGAS:
+        if TEST_PERFORMER[raga] not in available[raga]:
+            raise SystemExit(
+                f"TEST_PERFORMER[{raga}] = {TEST_PERFORMER[raga]} not in "
+                f"{sorted(available[raga])}"
+            )
     console.print(
-        f"{sum(len(performance['regions']) for performance in performances)} regions"
+        "test: " + ", ".join(f"{raga}/{TEST_PERFORMER[raga]}" for raga in RAGAS)
     )
 
     console.print("\n[bold]Beat tracking[/bold]")
@@ -198,7 +174,7 @@ def main() -> None:
     )
 
     beats_dir = root / ".cache" / "beats"
-    progress = Progress()
+    progress = Progress(console=console)
     task = progress.add_task("beats", total=len(performances))
     progress.start()
     for performance in performances:
@@ -227,186 +203,208 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    console.print("\n[bold]Svara embeddings[/bold]")
-    embedder = SvaraEmbedder(EMBED_DIM, EMBED_DEPTH)
-    encoder_state = torch.load(
-        root / "RISE" / "checkpoints" / "encoder.pth",
-        map_location="cpu",
-        weights_only=True,
-    )
-    embedder.encoder.load_state_dict(encoder_state)
-    del encoder_state
-    embedder.eval()
-    embedder.to(device)
-    console.print(f"Pretrained RISE encoder loaded from RISE/checkpoints/encoder.pth")
-
-    embeddings_dir = root / ".cache" / "embeddings"
-    progress = Progress()
-    task = progress.add_task("embeddings", total=len(performances))
-    progress.start()
-    for performance in performances:
-        raga = performance["raga"]
-        performer = performance["performer"]
-        progress.update(task, description=f"{raga}/{performer}")
-        embeddings_cache = embeddings_dir / raga / f"{performer}.pt"
-        if embeddings_cache.exists():
-            performance["embeddings"] = torch.load(
-                embeddings_cache, map_location="cpu", weights_only=False
-            )["embeddings"].numpy()
-        else:
-            performance["embeddings"] = encode_track(
-                embedder,
-                performance["contour"],
-                performance["voicing"],
-                device,
-            )
-            embeddings_cache.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {"embeddings": torch.from_numpy(performance["embeddings"].astype(np.float16))},
-                embeddings_cache,
-            )
-        progress.advance(task)
-
-    progress.stop()
-    del embedder
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    console.print("\n[bold]Classifier and Markov model[/bold]")
     classifier_dir = root / ".cache" / "classifier"
     markov_dir = root / ".cache" / "markov"
-    classifiers: dict[str, Any] = {}
-    markov: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    genetic_dir = root / ".cache" / "genetic"
+    test_performances = [
+        item
+        for item in performances
+        if item["performer"] == TEST_PERFORMER[item["raga"]]
+    ]
+
+    progress = Progress(console=console)
+    task = progress.add_task("classifier", total=2 * len(RAGAS))
+    progress.start()
     for raga in RAGAS:
+        ragged = [item for item in performances if item["raga"] == raga]
+        test = TEST_PERFORMER[raga]
+        training = [item for item in ragged if item["performer"] != test]
+
+        progress.update(task, description=f"{raga}: classifier")
+        console.print(f"\n[bold]{raga}[/bold]: loading fine-tuned RISE model")
+        model = ContextualSvaraClassifier(EMBED_DIM, EMBED_DEPTH, len(RAGA_SVARAS[raga]))
+        model.apply_lora(DEFAULT_RANK, DEFAULT_ALPHA, DEFAULT_DROPOUT)
+        state = torch.load(
+            root / "RISE" / ".cache" / "runs" / f"classification_{raga}_pretrained" / "best.pth",
+            map_location="cpu",
+            weights_only=True,
+        )
+        model.load_state_dict(state)
+        del state
+        model.eval()
+        model.to(device)
+        encode = make_encoder(model, device)
+
         classifier_path = classifier_dir / f"{raga}.joblib"
         markov_path = markov_dir / f"{raga}.npz"
+        classifier: Any
+        trigram: np.ndarray
+        bigram: np.ndarray
+        unigram: np.ndarray
+        cached = False
         if classifier_path.exists() and markov_path.exists():
-            classifiers[raga] = joblib.load(classifier_path)
-            stored = np.load(markov_path)
-            markov[raga] = (stored["trigram"], stored["bigram"], stored["unigram"])
-            console.print(f"{raga}: cached classifier and Markov model")
-            continue
-        features, labels = [], []
-        counts: dict[tuple[int, int, int], int] = {}
-        bigrams: dict[tuple[int, int], int] = {}
-        unigrams: dict[int, int] = {}
-        for performance in [item for item in performances if item["raga"] == raga]:
-            times = performance["times"].numpy()
-            step = float(times[1] - times[0]) if len(times) > 1 else 0.0
-            annotations = pd.read_csv(
-                data_dir / "annotations" / raga / f"{performance['performer']}_{raga}.tsv",
-                sep="\t",
+            candidate = joblib.load(classifier_path)
+            if candidate.named_steps["standardscaler"].n_features_in_ == CONTEXT_DIM:
+                classifier = candidate
+                stored = np.load(markov_path)
+                trigram = stored["trigram"]
+                bigram = stored["bigram"]
+                unigram = stored["unigram"]
+                cached = True
+                console.print(f"{raga}: cached classifier and Markov model")
+        if not cached:
+            features: list[np.ndarray] = []
+            labels: list[int] = []
+            counts: dict[tuple[int, int, int], int] = {}
+            bigrams: dict[tuple[int, int], int] = {}
+            unigrams: dict[int, int] = {}
+            for item in training:
+                times = item["times"].numpy()
+                contour = item["contour"].numpy()
+                begins, finishes, annotations = read_annotations(
+                    data_dir / "annotations" / raga / f"{item['performer']}_{raga}.tsv"
+                )
+                sequence = []
+                spans: list[tuple[float, float]] = []
+                for begin, finish, annotation in zip(
+                    begins, finishes, annotations, strict=True
+                ):
+                    label = annotation[0]
+                    if label not in SVARAS:
+                        continue
+                    if (
+                        int(np.searchsorted(times, finish))
+                        - int(np.searchsorted(times, begin))
+                        < 2
+                    ):
+                        continue
+                    spans.append((float(begin), float(finish)))
+                    labels.append(SVARAS.index(label))
+                    sequence.append(SVARAS.index(label))
+                features.extend(list(encode(times, contour, spans)))
+                for index in range(len(sequence) - 2):
+                    bigrams[(sequence[index], sequence[index + 1])] = (
+                        bigrams.get((sequence[index], sequence[index + 1]), 0) + 1
+                    )
+                    counts[
+                        (sequence[index], sequence[index + 1], sequence[index + 2])
+                    ] = counts.get(
+                        (sequence[index], sequence[index + 1], sequence[index + 2]), 0
+                    ) + 1
+                for value in sequence:
+                    unigrams[value] = unigrams.get(value, 0) + 1
+            annotated = len(features)
+            none_features: list[np.ndarray] = []
+            attempt = 0
+            while len(none_features) < annotated:
+                item = training[attempt % len(training)]
+                attempt += 1
+                if attempt > 20 * len(training) and not none_features:
+                    raise SystemExit(
+                        f"{raga}: no annotated coverage found in training performances"
+                    )
+                times = item["times"].numpy()
+                contour = item["contour"].numpy()
+                begins, finishes, _ = read_annotations(
+                    data_dir / "annotations" / raga / f"{item['performer']}_{raga}.tsv"
+                )
+                spans = coverage_frames(merge_coverage(begins, finishes), times)
+                if not spans:
+                    continue
+                sampled = sample_none_spans(
+                    spans, max(annotated // len(training), 1), rng
+                )
+                none_features.extend(list(encode(times, contour, frame_spans_to_seconds(sampled, times))))
+            none_features = none_features[:annotated]
+            features.extend(none_features)
+            labels.extend([len(SVARAS)] * len(none_features))
+            x = np.asarray(features, dtype=np.float64)
+            y = np.asarray(labels, dtype=np.int64)
+            base = RandomForestClassifier(
+                n_estimators=200,
+                min_samples_leaf=2,
+                class_weight="balanced",
+                n_jobs=-1,
+                random_state=args.seed,
             )
-            sequence = []
-            boundaries = [0]
-            for begin, finish, annotation in zip(
-                annotations["Begin time"],
-                annotations["End time"],
-                annotations["Annotation"],
-                strict=True,
-            ):
-                label = str(annotation)[0]
-                if label not in SVARAS:
-                    continue
-                start_frame = int(np.searchsorted(times, parse_time(begin)))
-                stop_frame = int(np.searchsorted(times, parse_time(finish)))
-                if stop_frame - start_frame < 2:
-                    continue
-                boundaries[-1] = start_frame
-                boundaries.append(stop_frame)
-                labels.append(SVARAS.index(label))
-                sequence.append(SVARAS.index(label))
-            if len(boundaries) > 1:
-                segment_features = segment_embeddings(
-                    build_prefix(performance["embeddings"]),
-                    np.asarray(boundaries, dtype=np.int64),
-                    EMBED_CONTEXT,
-                )
-                features.extend(list(segment_features))
-            for index in range(len(sequence) - 2):
-                bigrams[(sequence[index], sequence[index + 1])] = (
-                    bigrams.get((sequence[index], sequence[index + 1]), 0) + 1
-                )
-                counts[
-                    (sequence[index], sequence[index + 1], sequence[index + 2])
-                ] = counts.get(
-                    (sequence[index], sequence[index + 1], sequence[index + 2]), 0
-                ) + 1
-            for value in sequence:
-                unigrams[value] = unigrams.get(value, 0) + 1
-        none_features = sample_none_segments(
-            [item for item in performances if item["raga"] == raga], len(features), rng
-        )
-        features.extend(none_features)
-        labels.extend([len(SVARAS)] * len(none_features))
-        x = np.asarray(features, dtype=np.float64)
-        y = np.asarray(labels, dtype=np.int64)
-        base = RandomForestClassifier(
-            n_estimators=200,
-            min_samples_leaf=2,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=args.seed,
-        )
-        classifier = make_pipeline(
-            StandardScaler(), CalibratedClassifierCV(base, method="isotonic", cv=3)
-        )
-        classifier.fit(x, y)
-        classifiers[raga] = classifier
-        classifier_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(classifier, classifier_path)
+            classifier = make_pipeline(
+                StandardScaler(), CalibratedClassifierCV(base, method="isotonic", cv=3)
+            )
+            classifier.fit(x, y)
+            classifier_path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(classifier, classifier_path)
 
-        classes = len(SVARAS) + 1
-        trigram = np.zeros((classes, classes, classes))
-        bigram = np.zeros((classes, classes))
-        unigram = np.zeros(classes)
-        for (first, second, third), value in counts.items():
-            trigram[first, second, third] = value
-        for (first, second), value in bigrams.items():
-            bigram[first, second] = value
-        for key, value in unigrams.items():
-            unigram[key] = value
-        unigram = (unigram + 1e-3) / (unigram.sum() + 1e-3 * classes)
-        markov[raga] = (trigram, bigram, unigram)
-        markov_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(markov_path, trigram=trigram, bigram=bigram, unigram=unigram)
-        console.print(f"{raga}: classifier fitted on {len(y)} segments")
+            classes = len(SVARAS) + 1
+            trigram = np.zeros((classes, classes, classes))
+            bigram = np.zeros((classes, classes))
+            unigram = np.zeros(classes)
+            for (first, second, third), value in counts.items():
+                trigram[first, second, third] = value
+            for (first, second), value in bigrams.items():
+                bigram[first, second] = value
+            for key, value in unigrams.items():
+                unigram[key] = value
+            unigram = (unigram + 1e-3) / (unigram.sum() + 1e-3 * classes)
+            markov_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(markov_path, trigram=trigram, bigram=bigram, unigram=unigram)
+            console.print(
+                f"{raga}: {annotated} annotated + {len(none_features)} none segments, "
+                f"trained on {len(training)} performances (test {test})"
+            )
 
-    console.print("\n[bold]Genetic transcription[/bold]")
-    genetic_dir = root / ".cache" / "genetic"
-    progress = Progress()
-    task = progress.add_task("genetic", total=len(performances))
-    progress.start()
-    for performance in performances:
-        raga = performance["raga"]
-        performer = performance["performer"]
-        progress.update(task, description=f"{raga}/{performer}")
-        cache = genetic_dir / raga / f"{performer}.pt"
+        progress.advance(task)
+        progress.update(task, description=f"{raga}: genetic")
+
+        held = next(item for item in test_performances if item["raga"] == raga)
+        cache = genetic_dir / raga / f"{test}.pt"
+        times = held["times"].numpy()
+        contour = held["contour"].numpy()
+        begins, finishes, _ = read_annotations(
+            data_dir / "annotations" / raga / f"{test}_{raga}.tsv"
+        )
+        regions = coverage_frames(merge_coverage(begins, finishes), times)
+        notes: list[tuple[int, int, int]]
+        cached = None
         if cache.exists():
-            notes = torch.load(cache, map_location="cpu", weights_only=False)["notes"]
-        else:
-            beat_times = performance["beats"].numpy()
+            stored = torch.load(cache, map_location="cpu", weights_only=False)
+            if stored.get("regions") == regions and stored.get("cost") == [
+                args.alpha,
+                args.beta,
+            ]:
+                notes = stored["notes"]
+                cached = len(notes)
+                console.print(f"{raga}/{test}: cached transcription ({cached} notes)")
+        if cached is None:
+            beat_times = held["beats"].numpy()
             beat_frames = (
                 float(np.median(np.diff(beat_times)))
-                / float(performance["times"][1] - performance["times"][0])
+                / float(held["times"][1] - held["times"][0])
                 if len(beat_times) > 1
                 else 50.0
             )
-            trigram, bigram, unigram = markov[raga]
+
+            def embed_fn(
+                spans: list[tuple[int, int]],
+                times: np.ndarray = times,
+                contour: np.ndarray = contour,
+                encode: Any = encode,
+            ) -> np.ndarray:
+                return encode(
+                    times, contour, frame_spans_to_seconds(spans, times)
+                )
+
+            console.print(f"{raga}/{test}: transcribing {len(regions)} annotated regions")
             notes = genetic_transcribe(
-                performance["contour"].numpy(),
-                performance["embeddings"],
-                performance["regions"],
-                classifiers[raga],
+                contour,
+                regions,
+                embed_fn,
+                classifier,
                 trigram,
                 bigram,
                 unigram,
                 beat_frames,
-                EMBED_CONTEXT,
                 args.alpha,
                 args.beta,
-                args.gamma,
                 args.ga_population,
                 args.ga_iterations,
                 args.pm,
@@ -416,29 +414,30 @@ def main() -> None:
                 rng,
             )
             cache.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"notes": notes}, cache)
-        performance["notes"] = notes
+            torch.save(
+                {
+                    "notes": notes,
+                    "regions": regions,
+                    "cost": [args.alpha, args.beta],
+                },
+                cache,
+            )
+        held["notes"] = notes
         progress.advance(task)
 
-    progress.stop()
-    for performance in performances:
-        performance.pop("embeddings", None)
+        del model, encode
         gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
+    progress.stop()
     console.print("\n[bold]Evaluation[/bold]")
-    progress = Progress()
-    task = progress.add_task("evaluation", total=len(performances))
+    progress = Progress(console=console)
+    task = progress.add_task("evaluation", total=len(test_performances))
     progress.start()
-    condition = "genetic transcription"
     rows = []
     aggregated: dict[str, dict[str, list[float]]] = {}
-    confusion_total = {
-        raga: np.zeros((len(SVARAS), len(SVARAS)), dtype=np.int64) for raga in RAGAS
-    }
-    alignment_rows = {raga: [] for raga in RAGAS}
-    for performance in performances:
+    for performance in test_performances:
         raga = performance["raga"]
         performer = performance["performer"]
         progress.update(task, description=f"{raga}/{performer}")
@@ -449,24 +448,16 @@ def main() -> None:
             for start, stop, label in performance["notes"]
         ]
 
-        annotations = pd.read_csv(
-            data_dir / "annotations" / raga / f"{performer}_{raga}.tsv", sep="\t"
+        begins, finishes, annotations = read_annotations(
+            data_dir / "annotations" / raga / f"{performer}_{raga}.tsv"
         )
-        starts = [parse_time(value) for value in annotations["Begin time"]]
-        ends = [parse_time(value) for value in annotations["End time"]]
-        labels = [str(label)[0] for label in annotations["Annotation"]]
         reference = [
-            (starts[index], ends[index], labels[index])
-            for index in range(len(labels))
-            if labels[index] in SVARAS
-            and np.any((times >= starts[index]) & (times < ends[index]))
+            (float(begins[index]), float(finishes[index]), annotations[index][0])
+            for index in range(len(annotations))
+            if annotations[index][0] in SVARAS
+            and np.any((times >= begins[index]) & (times < finishes[index]))
         ]
-        coverage: list[list[float]] = []
-        for begin, finish in zip(starts, ends, strict=True):
-            if coverage and begin <= coverage[-1][1]:
-                coverage[-1][1] = max(coverage[-1][1], finish)
-            else:
-                coverage.append([begin, finish])
+        coverage = merge_coverage(begins, finishes)
         estimated = [
             note
             for note in estimated
@@ -474,113 +465,33 @@ def main() -> None:
         ]
         performance["reference"] = reference
         performance["estimated"] = estimated
+        performance["coverage"] = coverage
 
-        ref_intervals = np.array(
-            sorted([[note[0], note[1]] for note in reference]), dtype=float
-        ).reshape(-1, 2)
-        ref_onsets = ref_intervals[:, 0] if len(ref_intervals) else np.zeros(0)
-
-        est_intervals = np.array(
-            sorted([[note[0], note[1]] for note in estimated]), dtype=float
-        ).reshape(-1, 2)
-        est_onsets = est_intervals[:, 0] if len(est_intervals) else np.zeros(0)
-
-        if len(ref_intervals) and len(est_intervals):
-            onset_p, onset_r, onset_f = mir_eval.transcription.onset_precision_recall_f1(
-                ref_intervals, est_intervals, args.match_window
-            )
-            offset_p, offset_r, offset_f = mir_eval.transcription.offset_precision_recall_f1(
-                ref_intervals, est_intervals
-            )
-            boundary_p, boundary_r, boundary_f = mir_eval.segment.detection(
-                ref_intervals, est_intervals, args.match_window
-            )
-            pairs = mir_eval.util.match_events(ref_onsets, est_onsets, args.match_window)
-        else:
-            onset_p = onset_r = onset_f = 0.0
-            offset_p = offset_r = offset_f = 0.0
-            boundary_p = boundary_r = boundary_f = 0.0
-            pairs = []
-
-        y_true = [SVARAS.index(reference[i][2]) for i, _ in pairs]
-        y_pred = [SVARAS.index(estimated[j][2]) for _, j in pairs]
-        svara_f = (
-            f1_score(
-                y_true, y_pred, labels=range(len(SVARAS)), average="macro", zero_division=0.0
-            )
-            if pairs
-            else 0.0
+        beat_times = performance["beats"].numpy()
+        window = (
+            float(np.median(np.diff(beat_times))) / 2.0 if len(beat_times) > 1 else 0.1
         )
-        label_accuracy = (
-            float(np.mean(np.array(y_true) == np.array(y_pred))) if pairs else 0.0
-        )
-        confusion_total[raga] += confusion_matrix(
-            y_true, y_pred, labels=range(len(SVARAS))
-        )
-
-        ref_labels = "".join(note[2] for note in reference)
-        est_labels = "".join(note[2] for note in estimated)
-        distance = Levenshtein.distance(ref_labels, est_labels)
-        accuracy = 1.0 - distance / max(len(ref_labels), len(est_labels), 1)
-
-        metrics = {
-            "onset_precision": float(onset_p),
-            "onset_recall": float(onset_r),
-            "onset_f_measure": float(onset_f),
-            "offset_precision": float(offset_p),
-            "offset_recall": float(offset_r),
-            "offset_f_measure": float(offset_f),
-            "boundary_precision": float(boundary_p),
-            "boundary_recall": float(boundary_r),
-            "boundary_f_measure": float(boundary_f),
-            "svara_f_measure": float(svara_f),
-            "label_accuracy": label_accuracy,
-            "alignment_accuracy": float(accuracy),
-            "num_reference_notes": float(len(reference)),
-            "num_estimated_notes": float(len(estimated)),
-        }
+        metrics = paper_metrics(reference, estimated, window)
+        performance["metrics"] = metrics
         for key, value in metrics.items():
             aggregated.setdefault(raga, {}).setdefault(key, []).append(value)
         rows.append(
             (
                 raga,
                 performer,
-                f"{boundary_f:.3f}",
-                f"{onset_f:.3f}",
-                f"{offset_f:.3f}",
-                f"{svara_f:.3f}",
-                f"{label_accuracy:.3f}",
-                f"{accuracy:.3f}",
-            )
-        )
-
-        correct_ref = {i for i, j in pairs if reference[i][2] == estimated[j][2]}
-        correct_est = {j for i, j in pairs if reference[i][2] == estimated[j][2]}
-        alignment_rows[raga].append(
-            (
-                f"{raga}/{performer}",
-                [
-                    (note[0], note[1], note[2], index in correct_ref)
-                    for index, note in enumerate(reference)
-                ],
-                [
-                    (note[0], note[1], note[2], index in correct_est)
-                    for index, note in enumerate(estimated)
-                ],
+                f"{metrics['con_f1']:.3f}",
+                f"{metrics['conp_f1']:.3f}",
+                f"{metrics['conoff_f1']:.3f}",
+                f"{metrics['conpoff_f1']:.3f}",
+                f"{metrics['aor']:.3f}",
+                f"{metrics['levenshtein_norm']:.3f}",
+                f"{metrics['lcs_norm']:.3f}",
             )
         )
         progress.advance(task)
 
     progress.stop()
 
-    headline = (
-        "boundary_f_measure",
-        "onset_f_measure",
-        "offset_f_measure",
-        "svara_f_measure",
-        "label_accuracy",
-        "alignment_accuracy",
-    )
     means = {
         raga: {key: float(np.mean(values)) for key, values in aggregated[raga].items()}
         for raga in RAGAS
@@ -590,36 +501,51 @@ def main() -> None:
         for key in aggregated[RAGAS[0]]
     }
 
-    table = Table(title=f"Transcription ({condition})")
+    table = Table(title="Transcription (COn / COnP / COnOff / COnPOff)")
     for column in (
         "raga",
         "performer",
-        "boundary F",
-        "onset F",
-        "offset F",
-        "svara F",
-        "label acc",
-        "align acc",
+        "COn F",
+        "COnP F",
+        "COnOff F",
+        "COnPOff F",
+        "AOR",
+        "Lev norm",
+        "LCS norm",
     ):
         table.add_column(column)
     for row in rows:
         table.add_row(*row)
     console.print(table)
 
-    table = Table(title=f"Mean ({condition})")
+    table = Table(title="Mean (paper metrics)")
     table.add_column("raga")
     for column in (
-        "boundary F",
-        "onset F",
-        "offset F",
-        "svara F",
-        "label acc",
-        "align acc",
+        "COn F",
+        "COn P",
+        "COn R",
+        "COnP F",
+        "COnOff F",
+        "COnPOff F",
+        "AOR",
+        "Lev norm",
+        "LCS norm",
     ):
         table.add_column(column, justify="right")
+    mean_keys = (
+        "con_f1",
+        "con_precision",
+        "con_recall",
+        "conp_f1",
+        "conoff_f1",
+        "conpoff_f1",
+        "aor",
+        "levenshtein_norm",
+        "lcs_norm",
+    )
     for raga in [*RAGAS, "all"]:
         values = means[raga]
-        table.add_row(raga, *(f"{values[key]:.3f}" for key in headline))
+        table.add_row(raga, *(f"{values[key]:.3f}" for key in mean_keys))
     console.print(table)
 
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -632,7 +558,14 @@ def main() -> None:
                 "per_raga": {
                     raga: {
                         "mean": means[raga],
-                        "per_performance": [row for row in rows if row[0] == raga],
+                        "per_performance": [
+                            {
+                                "performer": item["performer"],
+                                "metrics": item["metrics"],
+                            }
+                            for item in test_performances
+                            if item["raga"] == raga
+                        ],
                     }
                     for raga in RAGAS
                 },
@@ -648,12 +581,13 @@ def main() -> None:
         columns=[
             "raga",
             "performer",
-            "boundary F",
-            "onset F",
-            "offset F",
-            "svara F",
-            "label acc",
-            "align acc",
+            "COn F",
+            "COnP F",
+            "COnOff F",
+            "COnPOff F",
+            "AOR",
+            "Lev norm",
+            "LCS norm",
         ],
     ).to_csv(metrics_path, index=False)
     console.print(f"table written to {metrics_path}")
@@ -671,37 +605,19 @@ def main() -> None:
 
     console.print("\n[bold]Plots[/bold]")
     plots_dir = root / "plots"
-    for raga in RAGAS:
-        performance = next(item for item in performances if item["raga"] == raga)
+    for performance in test_performances:
+        raga = performance["raga"]
         performer = performance["performer"]
-        figure = plot_confusion(
-            confusion_total[raga],
-            list(SVARAS),
-            f"Svara confusion ({raga})",
-        )
-        figure_path = plots_dir / raga / "confusion.png"
-        figure_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(figure_path, dpi=300, bbox_inches="tight")
-        console.print(f"figure written to {figure_path}")
-
-        alignment_path = plots_dir / raga / "alignment.png"
-        plot_alignment(alignment_rows[raga], alignment_path)
-        console.print(f"figure written to {alignment_path}")
-
         times = performance["times"].numpy()
-        duration = float(times[-1]) if len(times) else 0.0
-        start = float(np.random.uniform(0, max(duration - PLOT_SECONDS, 0.0)))
-        region = (start, min(start + PLOT_SECONDS, duration))
+        coverage = performance["coverage"]
+        region = plot_region(coverage, times)
         signal, _ = librosa.load(
             data_dir / "audio" / raga / f"{performer}.mp3",
             sr=args.sample_rate,
             mono=True,
         )
-        region_seconds = [
-            (float(times[start_frame]), float(times[min(stop_frame, len(times) - 1)]))
-            for start_frame, stop_frame in performance["regions"]
-        ]
-        transcription_path = plots_dir / raga / "transcription.png"
+        transcription_path = plots_dir / raga / f"{performer}_transcription.png"
+        transcription_path.parent.mkdir(parents=True, exist_ok=True)
         plot_transcription(
             signal,
             args.sample_rate,
@@ -712,161 +628,145 @@ def main() -> None:
             region,
             f"transcription ({performer})",
             transcription_path,
-            region_seconds,
+            coverage,
         )
         console.print(f"figure written to {transcription_path}")
+        del signal
 
-        beats = torch.load(
-            beats_dir / raga / f"{performer}.pt",
-            map_location="cpu",
-            weights_only=False,
-        )["beats"].numpy()
-        beats_path = plots_dir / raga / "beattrack.png"
-        plot_events(
-            signal,
-            args.sample_rate,
-            beats,
-            f"TCN beat tracking ({performer})",
-            region,
-            "#2ca02c",
-            beats_path,
+
+def lcs_length(first: str, second: str) -> int:
+    previous = [0] * (len(second) + 1)
+    for character in first:
+        current = [0]
+        for index, other in enumerate(second):
+            if character == other:
+                current.append(previous[index] + 1)
+            else:
+                current.append(max(current[-1], previous[index + 1]))
+        previous = current
+    return previous[-1]
+
+
+def match_counts(
+    reference: list[tuple[float, float, str]],
+    estimated: list[tuple[float, float, str]],
+    window: float,
+) -> tuple[int, int, int, int]:
+    ref_intervals = np.array([[note[0], note[1]] for note in reference], dtype=float)
+    est_intervals = np.array([[note[0], note[1]] for note in estimated], dtype=float)
+    if not len(ref_intervals) or not len(est_intervals):
+        return 0, 0, 0, 0
+    ref_onsets = ref_intervals[:, 0]
+    est_onsets = est_intervals[:, 0]
+    matches = mir_eval.util.match_events(ref_onsets, est_onsets, window)
+    onset = len(matches)
+    pitch = sum(reference[i][2] == estimated[j][2] for i, j in matches)
+    offset = sum(
+        abs(reference[i][1] - estimated[j][1]) <= window for i, j in matches
+    )
+    both = sum(
+        reference[i][2] == estimated[j][2]
+        and abs(reference[i][1] - estimated[j][1]) <= window
+        for i, j in matches
+    )
+    return onset, pitch, offset, both
+
+
+def prf(count: int, estimated: int, reference: int) -> tuple[float, float, float]:
+    precision = count / estimated if estimated else 0.0
+    recall = count / reference if reference else 0.0
+    f = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return f, precision, recall
+
+
+def paper_metrics(
+    reference: list[tuple[float, float, str]],
+    estimated: list[tuple[float, float, str]],
+    window: float,
+) -> dict[str, float]:
+    ref_intervals = np.array(
+        sorted([[note[0], note[1]] for note in reference]), dtype=float
+    ).reshape(-1, 2)
+    est_intervals = np.array(
+        sorted([[note[0], note[1]] for note in estimated]), dtype=float
+    ).reshape(-1, 2)
+    ref_sorted = [reference[index] for index in np.argsort(ref_intervals[:, 0])] if len(ref_intervals) else []
+    est_sorted = [estimated[index] for index in np.argsort(est_intervals[:, 0])] if len(est_intervals) else []
+
+    onset, pitch, offset, both = match_counts(ref_sorted, est_sorted, window)
+    metrics: dict[str, float] = {}
+    for key, count in (
+        ("con", onset),
+        ("conp", pitch),
+        ("conoff", offset),
+        ("conpoff", both),
+    ):
+        f, p, r = prf(count, len(est_sorted), len(ref_sorted))
+        metrics[f"{key}_f1"] = f
+        metrics[f"{key}_precision"] = p
+        metrics[f"{key}_recall"] = r
+
+    ious = []
+    if ref_sorted and est_sorted:
+        ref_array = np.array([[note[0], note[1]] for note in ref_sorted])
+        est_array = np.array([[note[0], note[1]] for note in est_sorted])
+        matches = mir_eval.util.match_events(
+            ref_array[:, 0], est_array[:, 0], window
         )
-        console.print(f"figure written to {beats_path}")
-        del signal, beats
+        for i, j in matches:
+            intersection = max(
+                0.0, min(ref_array[i, 1], est_array[j, 1]) - max(ref_array[i, 0], est_array[j, 0])
+            )
+            union = max(ref_array[i, 1], est_array[j, 1]) - min(
+                ref_array[i, 0], est_array[j, 0]
+            )
+            ious.append(intersection / union if union > 0 else 0.0)
+    metrics["aor"] = float(np.mean(ious)) if ious else 0.0
+
+    ref_labels = "".join(note[2] for note in ref_sorted)
+    est_labels = "".join(note[2] for note in est_sorted)
+    distance = Levenshtein.distance(ref_labels, est_labels)
+    lcs = lcs_length(ref_labels, est_labels)
+    metrics["levenshtein"] = float(distance)
+    metrics["levenshtein_norm"] = distance / max(len(ref_labels), 1)
+    metrics["lcs"] = float(lcs)
+    metrics["lcs_norm"] = lcs / max(len(ref_labels), 1)
+    metrics["num_reference_notes"] = float(len(ref_sorted))
+    metrics["num_estimated_notes"] = float(len(est_sorted))
+    return metrics
 
 
-def parse_time(value: str) -> float:
-    seconds = 0.0
-    for part in str(value).split(":"):
-        seconds = seconds * 60 + float(part)
-    return seconds
+def plot_region(
+    coverage: list[list[float]], times: np.ndarray
+) -> tuple[float, float]:
+    duration = float(times[-1]) if len(times) else 0.0
+    candidates = [span for span in coverage if span[1] - span[0] >= PLOT_SECONDS]
+    if candidates:
+        begin, finish = candidates[
+            random.randrange(len(candidates))
+        ]
+        start = random.uniform(begin, finish - PLOT_SECONDS)
+        return start, start + PLOT_SECONDS
+    if coverage:
+        longest = max(coverage, key=lambda span: span[1] - span[0])
+        return longest[0], min(longest[1], longest[0] + PLOT_SECONDS)
+    return 0.0, min(duration, PLOT_SECONDS)
 
 
 def parse_args() -> Namespace:
     parser = ArgumentParser(description="TRANSVARA")
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--beta", type=float, default=0.3)
-    parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--pm", type=float, default=0.75)
     parser.add_argument("--pc", type=float, default=0.75)
     parser.add_argument("--pd", type=float, default=0.5)
     parser.add_argument("--pa", type=float, default=0.75)
     parser.add_argument("--ga-population", type=int, default=40)
     parser.add_argument("--ga-iterations", type=int, default=50)
-    parser.add_argument("--match-window", type=float, default=0.05)
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
-
-
-def build_frames(
-    data_dir: Path, raga: str, performer: str, tonics: dict
-) -> dict[str, torch.Tensor]:
-    tonic = float(tonics[performer])
-    track = pd.read_csv(
-        data_dir / "pitch_tracks" / raga / f"{performer}.tsv",
-        sep="\t",
-        header=None,
-        names=["time", "frequency"],
-    )
-    times = track["time"].to_numpy(dtype=float)
-    frequency = track["frequency"].to_numpy(dtype=float)
-
-    raw = frequency.copy()
-    raw[raw == 0] = np.nan
-    voicing = (~np.isnan(raw)).astype(float)
-
-    contour = raw.copy()
-    is_gap = np.isnan(contour)
-    padded = np.concatenate(([False], is_gap, [False]))
-    edges = np.flatnonzero(padded[1:] != padded[:-1])
-    for start, stop in zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True):
-        if stop - start > 0.02:
-            continue
-        contour[start:stop] = np.nan
-    filled = pd.Series(contour).interpolate(method="linear").ffill().bfill().to_numpy()
-
-    smoothed = np.full_like(filled, np.nan)
-    voiced = np.where(~np.isnan(filled))[0]
-    if voiced.size:
-        for run in np.split(voiced, np.where(np.diff(voiced) > 1)[0] + 1):
-            run_times, run_cents = times[run], filled[run]
-            if run.size >= 4:
-                low, high = run_cents.min(), run_cents.max()
-                spline = UnivariateSpline(
-                    run_times, (run_cents - low) / (high - low), s=0.5
-                )
-                smoothed[run] = spline(run_times) * (high - low) + low
-            elif run.size > 1:
-                smoothed[run] = np.interp(run_times, run_times, run_cents)
-
-    cents = 1200.0 * np.log2(smoothed / tonic)
-    cents = (cents + 4200.0) / 8400.0
-
-    return {
-        "tonic": tonic,
-        "times": torch.from_numpy(times),
-        "contour": torch.from_numpy(cents.astype(np.float32)),
-        "voicing": torch.from_numpy(voicing.astype(np.float32)),
-    }
-
-
-def encode_track(
-    embedder: SvaraEmbedder,
-    contour: torch.Tensor,
-    voicing: torch.Tensor,
-    device: torch.device,
-) -> np.ndarray:
-    features = torch.stack(
-        [torch.nan_to_num(contour, nan=0.0) * voicing, 1.0 - voicing], dim=-1
-    ).transpose(0, 1)
-    frames = features.shape[1]
-    pooled: list[torch.Tensor] = []
-    with torch.no_grad():
-        for begin in range(0, frames, EMBED_CHUNK_FRAMES):
-            chunk = features[:, begin : begin + EMBED_CHUNK_FRAMES]
-            pooled.append(embedder.encoder(chunk.unsqueeze(0).to(device))[0].cpu())
-    encoded = torch.cat(pooled, dim=1).numpy()
-    positions = np.linspace(0, encoded.shape[1] - 1, frames)
-    left = np.floor(positions).astype(int)
-    right = np.ceil(positions).astype(int)
-    weight = positions - left
-    return (
-        encoded[:, left].T * (1.0 - weight)[:, np.newaxis]
-        + encoded[:, right].T * weight[:, np.newaxis]
-    ).astype(np.float32)
-
-
-def build_prefix(embeddings: np.ndarray) -> np.ndarray:
-    prefix = np.zeros((embeddings.shape[1], embeddings.shape[0] + 1), dtype=np.float64)
-    prefix[:, 1:] = np.cumsum(np.asarray(embeddings, dtype=np.float64), axis=0).T
-    return prefix
-
-
-def sample_none_segments(
-    performances: list[dict], count: int, rng: random.Random
-) -> list[np.ndarray]:
-    spans: list[np.ndarray] = []
-    for performance in performances:
-        prefix = build_prefix(performance["embeddings"])
-        for start, stop in performance["regions"]:
-            if stop - start < 4:
-                continue
-            length = rng.randrange(4, 64)
-            if stop - start <= length:
-                continue
-            begin = rng.randrange(start, stop - length)
-            spans.extend(
-                segment_embeddings(
-                    prefix,
-                    np.asarray([begin, begin + length], dtype=np.int64),
-                    EMBED_CONTEXT,
-                )
-            )
-            if len(spans) >= count:
-                return spans
-    return spans
 
 
 if __name__ == "__main__":
