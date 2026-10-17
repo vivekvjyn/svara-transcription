@@ -7,10 +7,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-CONTEXT_DURATION = 0.5
-ENCODE_BATCH = 128
-MIN_FRAMES = 16
-
 
 def build_frames(
     data_dir: Path, raga: str, performer: str, tonics: dict
@@ -76,12 +72,18 @@ def sample_none_spans(
     return sampled
 
 
-def _window(times: np.ndarray, contour: np.ndarray, begin: float, end: float) -> np.ndarray:
+def _window(
+    times: np.ndarray,
+    contour: np.ndarray,
+    begin: float,
+    end: float,
+    min_frames: int,
+) -> np.ndarray:
     values = contour[(times >= begin) & (times < end)]
     if values.size == 0:
-        return np.full(MIN_FRAMES, np.nan)
-    if values.size < MIN_FRAMES:
-        values = np.pad(values, (0, MIN_FRAMES - values.size), mode="edge")
+        return np.full(min_frames, np.nan)
+    if values.size < min_frames:
+        values = np.pad(values, (0, min_frames - values.size), mode="edge")
     return values
 
 
@@ -94,17 +96,32 @@ def _batch(windows: list[np.ndarray]) -> torch.Tensor:
     return torch.cat([torch.nan_to_num(padded, nan=0.0), silence], dim=1)
 
 
-def make_encoder(model, device):
+def make_encoder(
+    model, device, min_frames: int, context_duration: float, encode_batch: int
+):
     def encode(times: np.ndarray, contour: np.ndarray, spans: list[tuple[float, float]]) -> np.ndarray:
         outputs = []
-        for begin in range(0, len(spans), ENCODE_BATCH):
-            chunk = spans[begin : begin + ENCODE_BATCH]
+        for begin in range(0, len(spans), encode_batch):
+            chunk = spans[begin : begin + encode_batch]
             prec = _batch(
-                [_window(times, contour, start - CONTEXT_DURATION, start) for start, _ in chunk]
+                [
+                    _window(
+                        times, contour, start - context_duration, start, min_frames
+                    )
+                    for start, _ in chunk
+                ]
             )
-            curr = _batch([_window(times, contour, start, stop) for start, stop in chunk])
+            curr = _batch(
+                [
+                    _window(times, contour, start, stop, min_frames)
+                    for start, stop in chunk
+                ]
+            )
             succ = _batch(
-                [_window(times, contour, stop, stop + CONTEXT_DURATION) for _, stop in chunk]
+                [
+                    _window(times, contour, stop, stop + context_duration, min_frames)
+                    for _, stop in chunk
+                ]
             )
             with torch.no_grad():
                 encoded = model.encode(

@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+
+
+def plot_region(
+    coverage: list[list[float]], times: np.ndarray, seconds: float
+) -> tuple[float, float]:
+    duration = float(times[-1]) if len(times) else 0.0
+    candidates = [span for span in coverage if span[1] - span[0] >= seconds]
+    if candidates:
+        begin, finish = candidates[random.randrange(len(candidates))]
+        start = random.uniform(begin, finish - seconds)
+        return start, start + seconds
+    if coverage:
+        longest = max(coverage, key=lambda span: span[1] - span[0])
+        return longest[0], min(longest[1], longest[0] + seconds)
+    return 0.0, min(duration, seconds)
 
 
 def apply_plot_style() -> None:
@@ -31,9 +47,13 @@ def apply_plot_style() -> None:
     )
 
 
-def _segment_colour(index: int):
+def _svara_colour(svara: str):
     import matplotlib.pyplot as plt
 
+    order = "SRGMPDN"
+    index = order.find(svara.upper())
+    if index < 0:
+        index = len(order)
     return plt.cm.tab20((index % 20 + 0.5) / 20)
 
 
@@ -87,15 +107,15 @@ def plot_transcription(
                 continue
             begin = max(note_start, start)
             finish = min(note_end, stop)
-            colour = _segment_colour(index)
+            colour = _svara_colour(svara)
             mask = (times >= begin) & (times < finish)
             axis.plot(times[mask], clip[mask], color=colour, linewidth=0.4)
             axis.broken_barh(
-                [(begin, max(finish - begin, 0.02))],
+                [(begin + 0.01, max(finish - begin - 0.02, 0.02))],
                 (top, band),
                 facecolor=colour,
-                edgecolor="white",
-                linewidth=0.3,
+                edgecolor="black",
+                linewidth=0.7,
             )
             axis.text(
                 (begin + finish) / 2,
