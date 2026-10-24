@@ -1,8 +1,12 @@
-embed_dim: 48
-embed_depth: 5
-context_duration: 0.5
-encode_batch: 64
-min_frames: 16
-alpha: 0.7
-gamma: 0.2
+# TRANSVARA pipeline configuration
+plot_seconds: 15.0        # seconds of audio shown in each transcription plot
+embed_dim: 48             # RISE embedding dimension
+embed_depth: 5            # RISE inception depth
+context_duration: 0.5     # seconds of melodic context on each side
+encode_batch: 64          # spans encoded per forward pass (lower if GPU is small)
+min_frames: 16            # minimum pitch frames per window
+alpha: 0.7                # weight of the svara loss (beta = 1 - alpha)
+gamma: 0.2                # weight of the length loss
+delta: 0.01               # weight of Lnone: penalty per eighth-note transcribed
+                          # as none over a voiced (vocal) pitch region
 svaras: ["S", "R", "G", "M", "P", "D", "N"]

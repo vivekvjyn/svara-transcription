@@ -2,33 +2,28 @@
 
 Evolves candidate boundary sequences for the annotated regions of a
 performance and scores them with the combined svara, transition, and
-length fitness of the paper's genetic algorithm.  Children grow longer
-notes by joining adjacent segments where the classifier is least
-confident.
+length fitness of the paper's genetic algorithm.
 """
 
 from __future__ import annotations
 
 import random
-from functools import partial
 from typing import Any, Callable
 
 import numpy as np
-
-from .preprocess import frame_spans_to_seconds
 
 
 class GeneticOptimiser:
     """Genetic optimiser for svara boundary sequences.
 
-    Holds the classifier scoring function, svara transition model,
-    genetic parameters, and random state shared by every operation of
-    one run.
+    Holds the trained classifier, svara transition model, genetic
+    parameters, and random state shared by every operation of one run.
     """
 
     def __init__(
         self,
-        prob_fn: Callable[[list[tuple[int, int]]], np.ndarray],
+        embed_fn: Callable[[list[tuple[int, int]]], np.ndarray],
+        classifier: Any,
         trigram: np.ndarray,
         bigram: np.ndarray,
         unigram: np.ndarray,
@@ -38,10 +33,10 @@ class GeneticOptimiser:
     ) -> None:
         """Initialise the optimiser.
 
-        :param prob_fn: function mapping boundary pairs to classifier class
-            probabilities; implementations may cache by pair, since the
-            score of a span depends only on that span
-        :type prob_fn: Callable[[list[tuple[int, int]]], numpy.ndarray]
+        :param embed_fn: function mapping boundary pairs to contextual embeddings
+        :type embed_fn: Callable[[list[tuple[int, int]]], numpy.ndarray]
+        :param classifier: trained svara classifier exposing predict_proba and predict
+        :type classifier: Any
         :param trigram: second-order svara transition counts
         :type trigram: numpy.ndarray
         :param bigram: first-order svara transition counts
@@ -50,13 +45,13 @@ class GeneticOptimiser:
         :type unigram: numpy.ndarray
         :param svaras: svara alphabet; its length is the none-label index
         :type svaras: tuple[str, ...]
-        :param args: run arguments (ga_population, ga_iterations, pm, pc, pd, pa,
-            pj, join_threshold)
+        :param args: run arguments (ga_population, ga_iterations, pm, pc, pd, pa)
         :type args: argparse.Namespace
         :param rng: random number generator for reproducible evolution
         :type rng: random.Random
         """
-        self.prob_fn = prob_fn
+        self.embed_fn = embed_fn
+        self.classifier = classifier
         self.trigram = trigram
         self.bigram = bigram
         self.unigram = unigram
@@ -67,8 +62,6 @@ class GeneticOptimiser:
         self.pc = args.pc
         self.pd = args.pd
         self.pa = args.pa
-        self.pj = args.pj
-        self.join_threshold = args.join_threshold
         self.rng = rng
 
     @staticmethod
@@ -125,12 +118,12 @@ class GeneticOptimiser:
 
     @staticmethod
     def initial_boundaries(
-        candidates: np.ndarray, start: int, stop: int, dmin: int
+        peaks: np.ndarray, start: int, stop: int, dmin: int
     ) -> np.ndarray:
         """Build a seed boundary sequence covering a chunk.
 
-        :param candidates: candidate boundary frame indices (beat lattice)
-        :type candidates: numpy.ndarray
+        :param peaks: candidate boundary frame indices (beat lattice)
+        :type peaks: numpy.ndarray
         :param start: chunk start frame
         :type start: int
         :param stop: chunk end frame
@@ -141,12 +134,12 @@ class GeneticOptimiser:
         :rtype: numpy.ndarray
         """
         boundaries = [start]
-        for candidate in candidates:
-            if candidate - boundaries[-1] < dmin:
+        for peak in peaks:
+            if peak - boundaries[-1] < dmin:
                 continue
-            if stop - candidate < dmin:
+            if stop - peak < dmin:
                 break
-            boundaries.append(int(candidate))
+            boundaries.append(int(peak))
         boundaries.append(stop)
         return np.asarray(boundaries, dtype=np.int64)
 
@@ -282,77 +275,15 @@ class GeneticOptimiser:
             merged = np.concatenate([merged, [first[-1]]])
         return merged
 
-    def segment_scores(
-        self, boundaries: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Label and score each segment of one boundary vector.
-
-        Probabilities come through ``prob_fn``, so only spans never
-        seen before cost a model pass; every repeat is a table lookup.
-
-        :param boundaries: boundary frame indices, first and last included
-        :type boundaries: numpy.ndarray
-        :return: class label and confidence of every segment
-        :rtype: tuple[numpy.ndarray, numpy.ndarray]
-        """
-        values = np.asarray(boundaries, dtype=np.int64)
-        pairs = list(zip(values[:-1].tolist(), values[1:].tolist(), strict=True))
-        probabilities = self.prob_fn(pairs)
-        labels = probabilities.argmax(axis=1)
-        confidence = probabilities[np.arange(len(labels)), labels]
-        return labels, confidence
-
-    def join(
-        self, boundaries: np.ndarray, threshold: float, dmax: int
-    ) -> np.ndarray:
-        """Merge low-confidence neighbours into longer notes.
-
-        Greedy agglomerative pass over one boundary vector: while an
-        interior boundary both keeps its merged span within ``dmax``
-        and has an unconfident flank — the weaker of its two segments
-        scoring below ``threshold`` — the least confident such
-        boundary is removed and the merged span is re-scored before
-        the next decision.  A boundary the classifier straddles with an
-        unconfident segment is evidence of a cut through one note;
-        removing it lets the note stand as a single span, and a chain
-        of uncertain segments keeps merging while the join stays below
-        ``threshold`` and no longer than a whole note.  The first and
-        last boundaries (the chunk ends) are never removed, and every
-        merge only lengthens gaps, so the result keeps at least three
-        boundaries, honours ``dmin``, and never exceeds ``dmax``.
-
-        :param boundaries: boundary frame indices of the parent
-        :type boundaries: numpy.ndarray
-        :param threshold: confidence below which a flank invites a join
-        :type threshold: float
-        :param dmax: maximum merged span in frames (a whole note)
-        :type dmax: int
-        :return: boundary vector with confident boundaries preserved
-        :rtype: numpy.ndarray
-        """
-        values = [int(value) for value in boundaries]
-        while len(values) >= 4:
-            _, confidence = self.segment_scores(np.asarray(values, dtype=np.int64))
-            options: list[tuple[float, int]] = []
-            for index in range(1, len(values) - 1):
-                if values[index + 1] - values[index - 1] > dmax:
-                    continue
-                joint = min(confidence[index - 1], confidence[index])
-                if joint < threshold:
-                    options.append((joint, index))
-            if not options:
-                break
-            _, chosen = min(options)
-            values.pop(chosen)
-        return np.asarray(values, dtype=np.int64)
-
     def batch_costs(
         self,
         population: list[np.ndarray],
         alpha: float,
         beta: float,
         gamma: float,
+        delta: float,
         beat_frames: float,
+        voiced: np.ndarray,
     ) -> np.ndarray:
         """Evaluate the fitness of every member of a population.
 
@@ -360,7 +291,11 @@ class GeneticOptimiser:
         confidence (svara), the mean transition probability (trans), and
         the mean exponential decay of the note lengths in beats
         (length, so shorter notes score higher) are combined as
-        ``(alpha * svara + beta * trans) / (alpha + beta) + gamma * length``.
+        ``(alpha * svara + beta * trans) / (alpha + beta) + gamma * length
+        - delta * none``.  The none term counts, in eighth notes, the
+        segments labelled none that overlap voiced pitch frames, so
+        vocal material the classifier refuses to name costs one unit
+        per eighth note of its length.
 
         :param population: candidate boundary vectors
         :type population: list[numpy.ndarray]
@@ -370,8 +305,12 @@ class GeneticOptimiser:
         :type beta: float
         :param gamma: weight of the length term
         :type gamma: float
+        :param delta: weight of the none-over-voiced term, per eighth note
+        :type delta: float
         :param beat_frames: frame duration of one beat
         :type beat_frames: float
+        :param voiced: mask of contour frames carrying a pitch value
+        :type voiced: numpy.ndarray
         :return: fitness score of each member (higher is better)
         :rtype: numpy.ndarray
         """
@@ -381,48 +320,52 @@ class GeneticOptimiser:
             for member in population
             for pair in zip(member[:-1].tolist(), member[1:].tolist(), strict=True)
         ]
-        spans = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
-        starts, stops = spans[:, 0], spans[:, 1]
-        probabilities = self.prob_fn(pairs)
+        embeddings = self.embed_fn(pairs)
+        probabilities = self.classifier.predict_proba(embeddings)
         labels = probabilities.argmax(axis=1)
         confidence = probabilities[np.arange(len(labels)), labels]
         offsets = np.concatenate([[0], np.cumsum(counts)])
-        begins, ends = offsets[:-1], offsets[1:]
-
-        def member_sum(values: np.ndarray, skip: int = 0) -> np.ndarray:
-            """Sum ``values`` over each member's segments, dropping the first ``skip``."""
-            cumulative = np.concatenate([[0.0], np.cumsum(values)])
-            return cumulative[ends] - cumulative[np.minimum(begins + skip, ends)]
-
-        l_svara = member_sum(confidence) / counts
-        l_length = (
-            member_sum(np.exp(-(stops - starts) / max(beat_frames, 1.0))) / counts
-        )
-
-        # only segments two or three apart within one member carry the
-        # trigram term (the first two segments of a member never score);
-        # members shorter than three segments fall back to their unigram mean
-        first, second, current = labels[:-2], labels[1:-1], labels[2:]
-        pair_counts = self.bigram[first, second]
-        triplet_counts = self.trigram[first, second, current]
-        observed = np.where(
-            pair_counts > 0,
-            (triplet_counts + 1e-3) / (pair_counts + 1e-3 * len(self.svaras)),
-            self.unigram[current],
-        )
-        transition = np.zeros(len(labels))
-        transition[2:] = observed
-        long_enough = counts >= 3
-        l_trans = np.where(
-            long_enough,
-            member_sum(transition, 2) / np.maximum(counts - 2, 1),
-            member_sum(self.unigram[labels]) / counts,
-        )
-
-        return (alpha * l_svara + beta * l_trans) / (alpha + beta) + gamma * l_length
+        costs = np.empty(len(population))
+        for index in range(len(population)):
+            member = population[index]
+            segment_labels = labels[offsets[index] : offsets[index + 1]]
+            segment_confidence = confidence[offsets[index] : offsets[index + 1]]
+            l_svara = float(segment_confidence.mean())
+            if len(segment_labels) < 3:
+                l_trans = float(self.unigram[segment_labels].mean())
+            else:
+                current = segment_labels[2:]
+                first = segment_labels[:-2]
+                second = segment_labels[1:-1]
+                pairs_counts = self.bigram[first, second]
+                triplets = self.trigram[first, second, current]
+                observed = np.where(
+                    pairs_counts > 0,
+                    (triplets + 1e-3) / (pairs_counts + 1e-3 * len(self.svaras)),
+                    self.unigram[current],
+                )
+                l_trans = float(observed.mean())
+            lengths_beats = np.diff(member) / max(beat_frames, 1.0)
+            l_length = float(np.exp(-lengths_beats).mean())
+            none_index = len(self.svaras)
+            l_none = 0.0
+            for frame_start, frame_stop, is_none in zip(
+                member[:-1], member[1:], segment_labels == none_index, strict=True
+            ):
+                if is_none and voiced[frame_start:frame_stop].any():
+                    l_none += 2.0 * float(frame_stop - frame_start) / max(
+                        beat_frames, 1.0
+                    )
+            costs[index] = (
+                (alpha * l_svara + beta * l_trans) / (alpha + beta)
+                + gamma * l_length
+                - delta * l_none
+            )
+        return costs
 
     def optimise_chunk(
         self,
+        contour: np.ndarray,
         start: int,
         stop: int,
         lattice: np.ndarray,
@@ -432,18 +375,17 @@ class GeneticOptimiser:
         alpha: float,
         beta: float,
         gamma: float,
+        delta: float,
         beat_frames: float,
     ) -> np.ndarray:
         """Evolve the fittest boundary sequence for one chunk.
 
         Seeds the population from the beat-lattice candidates inside the
         chunk, then applies selection, crossover, and mutation for
-        ``args.ga_iterations`` generations.  Children are followed — with
-        probability ``args.pj`` — by a confidence join pass
-        (:meth:`join`) that merges adjacent segments scoring below
-        ``args.join_threshold``, so they grow longer notes exactly where
-        the classifier is least sure.
+        ``args.ga_iterations`` generations.
 
+        :param contour: pitch contour frames of the whole performance
+        :type contour: numpy.ndarray
         :param start: chunk start frame
         :type start: int
         :param stop: chunk end frame
@@ -462,12 +404,15 @@ class GeneticOptimiser:
         :type beta: float
         :param gamma: weight of the length term
         :type gamma: float
+        :param delta: weight of the none-over-voiced term, per eighth note
+        :type delta: float
         :param beat_frames: frame duration of one beat
         :type beat_frames: float
         :return: best boundary vector found for the chunk
         :rtype: numpy.ndarray
         """
         rng = self.rng
+        voiced = np.isfinite(contour)
         low = int(np.searchsorted(lattice, start))
         high = int(np.searchsorted(lattice, stop))
         candidates = lattice[low:high]
@@ -478,7 +423,9 @@ class GeneticOptimiser:
         while len(population) < self.population_size:
             mutated = self.mutate(seed.copy(), lattice, dmin, dmax, smax)
             population.append(mutated if len(mutated) >= 3 else seed.copy())
-        scores = self.batch_costs(population, alpha, beta, gamma, beat_frames)
+        scores = self.batch_costs(
+            population, alpha, beta, gamma, delta, beat_frames, voiced
+        )
         for _ in range(self.iterations):
             order = np.argsort(scores)[::-1]
             parent_count = max(2, self.population_size // 4)
@@ -493,14 +440,12 @@ class GeneticOptimiser:
                     lattice,
                     dmax,
                 )
-                if len(child) >= 4 and rng.random() < self.pj:
-                    child = self.join(child, self.join_threshold, dmax)
                 if len(child) < 3 or child[0] != start or child[-1] != stop:
                     child = first.copy()
                 next_population.append(child)
                 next_scores.append(0.0)
             evolved = self.batch_costs(
-                next_population[1:], alpha, beta, gamma, beat_frames
+                next_population[1:], alpha, beta, gamma, delta, beat_frames, voiced
             )
             next_scores[1:] = evolved
             population = next_population
@@ -509,12 +454,14 @@ class GeneticOptimiser:
 
     def transcribe(
         self,
+        contour: np.ndarray,
         regions: list[tuple[int, int]],
         beats: np.ndarray,
         beat_frames: float,
         alpha: float,
         beta: float,
         gamma: float,
+        delta: float,
     ) -> list[tuple[int, int, int]]:
         """Transcribe all annotated regions of a performance.
 
@@ -526,6 +473,8 @@ class GeneticOptimiser:
         from a 16th up to a whole note, is available, with a 16th as the
         minimum and a whole note as the maximum.
 
+        :param contour: pitch contour frames of the whole performance
+        :type contour: numpy.ndarray
         :param regions: annotated frame regions to transcribe
         :type regions: list[tuple[int, int]]
         :param beats: frame indices of the tracked beats
@@ -538,6 +487,8 @@ class GeneticOptimiser:
         :type beta: float
         :param gamma: weight of the length term
         :type gamma: float
+        :param delta: weight of the none-over-voiced term, per eighth note
+        :type delta: float
         :return: notes as (start frame, stop frame, svara label) triples
         :rtype: list[tuple[int, int, int]]
         """
@@ -556,6 +507,7 @@ class GeneticOptimiser:
                 if chunk_stop - chunk_start < 2 * dmin:
                     break
                 boundaries = self.optimise_chunk(
+                    contour,
                     chunk_start,
                     chunk_stop,
                     lattice,
@@ -565,13 +517,16 @@ class GeneticOptimiser:
                     alpha,
                     beta,
                     gamma,
+                    delta,
                     beat_frames,
                 )
                 if len(boundaries) >= 2:
                     pairs = list(
                         zip(boundaries[:-1].tolist(), boundaries[1:].tolist(), strict=True)
                     )
-                    labels = self.prob_fn(pairs).argmax(axis=1)
+                    labels = self.classifier.predict(self.embed_fn(pairs)).astype(
+                        np.int64
+                    )
                     for index in range(len(labels)):
                         if labels[index] != len(self.svaras):
                             notes.append(
@@ -583,91 +538,3 @@ class GeneticOptimiser:
                             )
                 chunk_start = chunk_stop
         return notes
-
-
-def classifier_probabilities(
-    spans, *, classifier, encode, times, contour, rows
-) -> np.ndarray:
-    """Classifier class probabilities for each boundary pair.
-
-    Pairs are encoded and classified once and remembered in ``rows``, so a
-    span scored by several population members costs one classifier call.
-
-    :param spans: boundary pairs to score
-    :type spans: list[tuple[int, int]]
-    :param classifier: fitted svara classifier
-    :param encode: builds the model input of a list of second-long spans
-    :param times: frame times of the performance
-    :type times: numpy.ndarray
-    :param contour: pitch contour frames of the performance
-    :type contour: numpy.ndarray
-    :param rows: memo filled in place with one probability row per pair
-    :type rows: dict
-    :return: one row of class probabilities per requested pair
-    :rtype: numpy.ndarray
-    """
-    missing = [pair for pair in dict.fromkeys(spans) if pair not in rows]
-    if missing:
-        probabilities = classifier.predict_proba(
-            encode(times, contour, frame_spans_to_seconds(missing, times))
-        )
-        for pair, row in zip(missing, probabilities, strict=True):
-            rows[pair] = row
-    if not spans:
-        return np.zeros((0, len(classifier.classes_)), dtype=np.float64)
-    return np.stack([rows[pair] for pair in spans])
-
-
-def transcribe(
-    encode,
-    classifier,
-    trigram,
-    bigram,
-    unigram,
-    args,
-    rng,
-    performance,
-    regions,
-    beats,
-    beat_frames,
-    cost,
-    svaras,
-) -> list[tuple[int, int, int]]:
-    """Transcribe every annotated region of one performance.
-
-    Builds the memoised classifier scorer over the performance's contour and
-    hands the regions, the beat lattice, and the three cost weights to the
-    genetic optimiser.
-
-    :param performance: frame data of the performance being transcribed
-    :type performance: dict
-    :param regions: annotated frame regions to transcribe
-    :type regions: list[tuple[int, int]]
-    :param beats: frame indices of the tracked beats
-    :type beats: numpy.ndarray
-    :param beat_frames: frame duration of one beat
-    :type beat_frames: float
-    :param cost: weights of the svara, transition, and length terms
-    :type cost: list[float]
-    :param svaras: svara symbols in label order
-    :type svaras: tuple[str, ...]
-    :return: notes as (start frame, stop frame, svara label) triples
-    :rtype: list[tuple[int, int, int]]
-    """
-    times = performance["times"].numpy()
-    contour = performance["contour"].numpy()
-    rows = performance.setdefault("prob_rows", {})
-    prob_fn = partial(
-        classifier_probabilities,
-        classifier=classifier,
-        encode=encode,
-        times=times,
-        contour=contour,
-        rows=rows,
-    )
-    optimiser = GeneticOptimiser(
-        prob_fn, trigram, bigram, unigram, svaras, args, rng
-    )
-    return optimiser.transcribe(
-        regions, beats, beat_frames, cost[0], cost[1], cost[2]
-    )

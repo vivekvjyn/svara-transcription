@@ -6,29 +6,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import yaml
 
 
-def read_pitch_track(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read a two-column ``time`` / ``frequency`` pitch track."""
-    track = pd.read_csv(path, sep="\t", header=None, names=["time", "frequency"])
-    return track["time"].to_numpy(dtype=float), track["frequency"].to_numpy(dtype=float)
-
-
-def tonic_for(tonics_path: Path, performer: str) -> float:
-    """Return the performer's tonic from the tonics file."""
-    tonics = yaml.safe_load(tonics_path.read_text()) if tonics_path.exists() else {}
-    if performer not in tonics:
-        raise SystemExit(f"no tonic for {performer} in {tonics_path}")
-    return float(tonics[performer])
-
-
-def build_frames(pitch_path: Path, tonic: float) -> dict[str, torch.Tensor]:
-    """Clean a raw pitch track into the normalised contour the model consumes."""
+def build_frames(
+    data_dir: Path, raga: str, performer: str, tonics: dict
+) -> dict[str, torch.Tensor]:
     from rise.data.preprocessing import prepare_contour
 
-    times, frequency = read_pitch_track(pitch_path)
-    contour = prepare_contour(times, frequency, tonic, 0.5, 7)
+    tonic = float(tonics[performer])
+    track = pd.read_csv(
+        data_dir / "pitch_tracks" / raga / f"{performer}.tsv",
+        sep="\t",
+        header=None,
+        names=["time", "frequency"],
+    )
+    times = track["time"].to_numpy(dtype=float)
+    frequency = track["frequency"].to_numpy(dtype=float)
+    contour = prepare_contour(times, frequency, tonic, 0.5, 0.02)
     return {
         "tonic": tonic,
         "times": torch.from_numpy(times),
@@ -36,43 +30,18 @@ def build_frames(pitch_path: Path, tonic: float) -> dict[str, torch.Tensor]:
     }
 
 
-def beat_spacing(
-    beats: torch.Tensor, times: torch.Tensor
-) -> tuple[np.ndarray, float, float]:
-    """Frame index of every beat, plus one beat in frames and in seconds."""
-    beat_times = beats.numpy()
-    times_array = times.numpy()
-    step = float(times_array[1] - times_array[0]) if len(times_array) > 1 else 0.0
-    frames = np.clip(
-        np.searchsorted(times_array, beat_times), 0, max(len(times_array) - 1, 0)
-    )
-    if len(beat_times) > 1:
-        interval = float(np.median(np.diff(beat_times)))
-        return frames, (interval / step if step > 0 else 50.0), interval / 2.0
-    return frames, 50.0, 0.1
-
-
 def read_annotations(path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Read ``start time`` / ``end time`` / ``label`` annotation rows.
-
-    Timestamps are ``HH:MM:SS.mmm`` and labels are reduced to their svara
-    symbol's first letter, upper-cased, so ``"sa"`` and ``"S^"`` both give
-    ``"S"``.
-    """
     annotations = pd.read_csv(path, sep="\t")
-    begins = pd.to_timedelta(annotations["start time"]).dt.total_seconds().to_numpy()
-    finishes = pd.to_timedelta(annotations["end time"]).dt.total_seconds().to_numpy()
-    labels = [str(label).strip()[0].upper() for label in annotations["label"]]
+    begins = pd.to_timedelta(annotations["Begin time"]).dt.total_seconds().to_numpy()
+    finishes = pd.to_timedelta(annotations["End time"]).dt.total_seconds().to_numpy()
+    labels = [str(label) for label in annotations["Annotation"]]
     return begins, finishes, labels
 
 
-def merge_coverage(
-    begins: np.ndarray, finishes: np.ndarray, gap: float = 0.0
-) -> list[list[float]]:
-    """Collapse sorted annotation spans into runs separated by more than ``gap`` seconds."""
+def merge_coverage(begins: np.ndarray, finishes: np.ndarray) -> list[list[float]]:
     coverage: list[list[float]] = []
     for begin, finish in zip(begins.tolist(), finishes.tolist(), strict=True):
-        if coverage and begin <= coverage[-1][1] + gap:
+        if coverage and begin <= coverage[-1][1]:
             coverage[-1][1] = max(coverage[-1][1], finish)
         else:
             coverage.append([begin, finish])
