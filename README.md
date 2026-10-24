@@ -11,5 +11,5 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python scripts/main.py
+python -m transvara
 ```
