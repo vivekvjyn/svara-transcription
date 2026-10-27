@@ -2,4 +2,5 @@
 *.py[cod]
 *.egg-info
 .cache
+model_weights
 *.mp3

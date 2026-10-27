@@ -11,7 +11,7 @@ import torch
 def build_frames(
     data_dir: Path, raga: str, performer: str, tonics: dict
 ) -> dict[str, torch.Tensor]:
-    from rise.data.preprocessing import prepare_contour
+    from .nn.preprocessing import prepare_contour
 
     tonic = float(tonics[performer])
     track = pd.read_csv(
@@ -38,14 +38,41 @@ def read_annotations(path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
     return begins, finishes, labels
 
 
-def merge_coverage(begins: np.ndarray, finishes: np.ndarray) -> list[list[float]]:
+def merge_coverage(
+    begins: np.ndarray, finishes: np.ndarray, gap: float = 0.0
+) -> list[list[float]]:
+    """Merge annotated spans, treating spans less than ``gap`` seconds apart as one.
+
+    ``gap=0.0`` merges touching spans only (the coverage used to score notes);
+    phrases are merged with ``gap=0.5`` so one sung phrase is one string.
+    """
     coverage: list[list[float]] = []
     for begin, finish in zip(begins.tolist(), finishes.tolist(), strict=True):
-        if coverage and begin <= coverage[-1][1]:
+        if coverage and begin <= coverage[-1][1] + gap:
             coverage[-1][1] = max(coverage[-1][1], finish)
         else:
             coverage.append([begin, finish])
     return coverage
+
+
+def read_beats(path: Path) -> torch.Tensor:
+    """Beat times from an exported ``data/beat_tracks`` TSV (``time`` / ``beat``)."""
+    track = pd.read_csv(path, sep="\t", header=None, names=["time", "beat"])
+    return torch.from_numpy(track["time"].to_numpy(dtype=float))
+
+
+#: The seven svaras and the subset each raga draws from (vendored from RISE).
+ALL_SVARAS: tuple[str, ...] = ("S", "R", "G", "M", "P", "D", "N")
+
+RAGA_SVARAS: dict[str, tuple[str, ...]] = {
+    "abhogi": ("S", "R", "G", "M", "D"),
+    "begada": ALL_SVARAS,
+    "kalyani": ALL_SVARAS,
+    "mohanam": ("S", "R", "G", "P", "D"),
+    "sahana": ALL_SVARAS,
+    "saveri": ALL_SVARAS,
+    "sri": ALL_SVARAS,
+}
 
 
 def coverage_frames(coverage: list[list[float]], times: np.ndarray) -> list[tuple[int, int]]:
