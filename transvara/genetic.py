@@ -52,21 +52,6 @@ class GeneticOptimiser:
         return np.asarray(sorted(set(points)), dtype=np.int64)
 
     @staticmethod
-    def _snap(lattice: np.ndarray, position: int, low: int, high: int) -> int | None:
-        if lattice.size == 0 or high < low:
-            return None
-        index = int(np.searchsorted(lattice, position))
-        best: tuple[float, int] | None = None
-        for candidate in (index - 1, index, index + 1):
-            if 0 <= candidate < lattice.size:
-                value = int(lattice[candidate])
-                if low <= value <= high:
-                    distance = abs(value - position)
-                    if best is None or distance < best[0]:
-                        best = (distance, value)
-        return best[1] if best else None
-
-    @staticmethod
     def initial_boundaries(
         peaks: np.ndarray, start: int, stop: int, dmin: int
     ) -> np.ndarray:
@@ -80,23 +65,23 @@ class GeneticOptimiser:
         boundaries.append(stop)
         return np.asarray(boundaries, dtype=np.int64)
 
-    @staticmethod
     def repair(
-        boundaries: np.ndarray, lattice: np.ndarray, dmax: int
+        self, boundaries: np.ndarray, lattice: np.ndarray, dmax: int
     ) -> np.ndarray:
         values = [int(value) for value in boundaries]
         index = 0
         while index < len(values) - 1:
             gap = values[index + 1] - values[index]
             if gap > dmax:
-                snapped = GeneticOptimiser._snap(
-                    lattice,
-                    values[index] + gap // 2,
-                    values[index] + 1,
-                    values[index + 1] - 1,
-                )
+                candidates = lattice[
+                    (lattice >= values[index] + 1)
+                    & (lattice <= min(values[index + 1] - 1, values[index] + dmax))
+                ]
                 values.insert(
-                    index + 1, snapped if snapped is not None else values[index] + gap // 2
+                    index + 1,
+                    int(candidates[self.rng.randrange(len(candidates))])
+                    if candidates.size
+                    else values[index] + gap // 2,
                 )
                 if values[index + 1] - values[index] > dmax:
                     continue
@@ -143,11 +128,14 @@ class GeneticOptimiser:
                 continue
             width = right - left
             if (rng.random() < self.pa or width > dmax) and width // 2 >= dmin:
-                snapped = self._snap(
-                    lattice, left + width // 2, left + dmin, right - dmin
-                )
-                if snapped is not None:
-                    values[index] = snapped
+                candidates = [
+                    int(value)
+                    for value in lattice[
+                        (lattice >= left + dmin) & (lattice <= right - dmin)
+                    ]
+                ]
+                if candidates:
+                    values[index] = candidates[rng.randrange(len(candidates))]
         kept = sorted({value for value in values if value is not None})
         return np.asarray(kept, dtype=np.int64)
 

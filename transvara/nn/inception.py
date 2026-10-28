@@ -5,23 +5,18 @@ from itertools import pairwise
 import torch
 from torch import nn
 
-KERNEL_SIZES = (9, 19, 39)
-
-NUM_BRANCHES = len(KERNEL_SIZES)
-
-LEGACY_BRANCH_PREFIXES = tuple(f"branch{index + 1}." for index in range(NUM_BRANCHES))
-
 
 def branch_widths(out_channels: int) -> list[int]:
-    base, remainder = divmod(out_channels, NUM_BRANCHES)
-    return [base + (1 if index < remainder else 0) for index in range(NUM_BRANCHES)]
+    base, remainder = divmod(out_channels, 3)
+    return [base + (1 if index < remainder else 0) for index in range(3)]
 
 
 class _LegacyBranchNames:
     """Accept ``branch1``/``branch2``/``branch3`` keys from pre-ModuleList checkpoints."""
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        for index, legacy in enumerate(LEGACY_BRANCH_PREFIXES):
+        for index in range(3):
+            legacy = f"branch{index + 1}."
             for key in [k for k in state_dict if k.startswith(prefix + legacy)]:
                 renamed = key.replace(prefix + legacy, f"{prefix}branches.{index}.", 1)
                 state_dict[renamed] = state_dict.pop(key)
@@ -35,7 +30,7 @@ class InceptionBlock(_LegacyBranchNames, nn.Module):
         super().__init__()
         self.branches = nn.ModuleList(
             nn.Conv1d(in_channels, width, kernel_size=size, padding=size // 2)
-            for size, width in zip(KERNEL_SIZES, branch_widths(out_channels), strict=True)
+            for size, width in zip((9, 19, 39), branch_widths(out_channels), strict=True)
         )
         self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1)
 
@@ -50,7 +45,7 @@ class TransposeInceptionBlock(_LegacyBranchNames, nn.Module):
         super().__init__()
         self.branches = nn.ModuleList(
             nn.ConvTranspose1d(in_channels, width, kernel_size=size, padding=size // 2)
-            for size, width in zip(KERNEL_SIZES, branch_widths(out_channels), strict=True)
+            for size, width in zip((9, 19, 39), branch_widths(out_channels), strict=True)
         )
         self.residual = nn.ConvTranspose1d(in_channels, out_channels, kernel_size=1)
 

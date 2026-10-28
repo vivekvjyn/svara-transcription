@@ -5,11 +5,7 @@ from torch import nn
 
 from .attention import CoAttention
 from .inception import InceptionEncoder
-from .lora import DEFAULT_ALPHA, DEFAULT_DROPOUT, DEFAULT_RANK, apply_lora
-
-NUM_INPUT_FEATURES = 2
-
-CONTEXT_STREAMS = ("prec", "curr", "succ")
+from .lora import apply_lora
 
 
 class ContextualSvaraClassifier(nn.Module):
@@ -27,7 +23,7 @@ class ContextualSvaraClassifier(nn.Module):
         embed_dim: int,
         depth: int,
         num_classes: int,
-        num_features: int = NUM_INPUT_FEATURES,
+        num_features: int = 2,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
@@ -41,9 +37,9 @@ class ContextualSvaraClassifier(nn.Module):
 
         self.attention = CoAttention(embed_dim)
         self.head = nn.Sequential(
-            nn.BatchNorm1d(embed_dim * len(CONTEXT_STREAMS)),
+            nn.BatchNorm1d(embed_dim * 3),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim * len(CONTEXT_STREAMS), embed_dim),
+            nn.Linear(embed_dim * 3, embed_dim),
             nn.ReLU(),
             nn.BatchNorm1d(embed_dim),
             nn.Dropout(dropout),
@@ -83,9 +79,9 @@ class ContextualSvaraClassifier(nn.Module):
 
     def apply_lora(
         self,
-        rank: int = DEFAULT_RANK,
-        alpha: int = DEFAULT_ALPHA,
-        dropout: float = DEFAULT_DROPOUT,
+        rank: int = 8,
+        alpha: int = 16,
+        dropout: float = 0.05,
     ) -> None:
         self.prec_encoder = apply_lora(self.prec_encoder, rank, alpha, dropout)
         self.curr_encoder = apply_lora(self.curr_encoder, rank, alpha, dropout)

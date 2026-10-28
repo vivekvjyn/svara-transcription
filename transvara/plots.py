@@ -3,6 +3,11 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 
@@ -23,8 +28,6 @@ def plot_region(
 
 
 def apply_plot_style() -> None:
-    import matplotlib
-
     matplotlib.rcParams.update(
         {
             "figure.dpi": 120,
@@ -48,8 +51,6 @@ def apply_plot_style() -> None:
 
 
 def _svara_colour(svara: str):
-    import matplotlib.pyplot as plt
-
     order = "SRGMPDN"
     index = order.find(svara.upper())
     if index < 0:
@@ -66,8 +67,6 @@ def plot_transcription(
     path: Path,
     vocal: list[tuple[float, float]] | None = None,
 ) -> None:
-    import matplotlib.pyplot as plt
-
     apply_plot_style()
     start, stop = region
     selected = (pitch_times >= start) & (pitch_times <= stop)

@@ -11,19 +11,10 @@ import torch
 from scipy.interpolate import UnivariateSpline
 
 
-CENTS_PER_OCTAVE = 1200
-
-FloatArray = npt.NDArray[np.float64]
-
-
-def hz_to_cents(frequency: npt.ArrayLike, tonic: float) -> FloatArray:
-    return CENTS_PER_OCTAVE * np.log2(np.asarray(frequency, dtype=float) / tonic)
-
-
-def unvoiced_to_nan(frequency: npt.ArrayLike) -> FloatArray:
-    values = np.asarray(frequency, dtype=float).copy()
-    values[values == 0] = np.nan
-    return values
+def hz_to_cents(
+    frequency: npt.ArrayLike, tonic: float
+) -> npt.NDArray[np.float64]:
+    return 1200 * np.log2(np.asarray(frequency, dtype=float) / tonic)
 
 
 def interpolate_gaps(
@@ -31,12 +22,16 @@ def interpolate_gaps(
     gap_value: float = np.nan,
     max_gap: float = 0.02,
     protected_indices: Iterable[int] | None = None,
-) -> FloatArray:
+) -> npt.NDArray[np.float64]:
     contour = np.asarray(values, dtype=float).copy()
     protected = set(protected_indices or ())
     is_gap = np.isnan(contour) if np.isnan(gap_value) else contour == gap_value
 
-    for start, stop in _runs(is_gap):
+    padded = np.concatenate(([False], np.asarray(is_gap, dtype=bool), [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    for start, stop in zip(
+        edges[::2].tolist(), edges[1::2].tolist(), strict=True
+    ):
         if stop - start > max_gap:
             continue
         if protected & set(range(start, stop)):
@@ -51,7 +46,7 @@ def smooth_contour(
     cents: npt.ArrayLike,
     smoothing_factor: float = 0.5,
     min_points: int = 4,
-) -> FloatArray:
+) -> npt.NDArray[np.float64]:
     times = np.asarray(times, dtype=float)
     cents = np.asarray(cents, dtype=float)
     smoothed = np.full_like(cents, np.nan)
@@ -72,20 +67,15 @@ def smooth_contour(
     return smoothed
 
 
-def _runs(flags: npt.NDArray[np.bool_]) -> list[tuple[int, int]]:
-    padded = np.concatenate(([False], np.asarray(flags, dtype=bool), [False]))
-    edges = np.flatnonzero(padded[1:] != padded[:-1])
-    return list(zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True))
-
-
 def prepare_contour(
-    times: FloatArray,
-    frequency: FloatArray,
+    times: npt.NDArray[np.float64],
+    frequency: npt.NDArray[np.float64],
     tonic: float,
     smoothing_factor: float,
     interpolation_gap: float,
-) -> FloatArray:
-    contour = unvoiced_to_nan(frequency)
+) -> npt.NDArray[np.float64]:
+    contour = np.asarray(frequency, dtype=float).copy()
+    contour[contour == 0] = np.nan
     contour = interpolate_gaps(contour, np.nan, interpolation_gap)
     contour = smooth_contour(times, contour, smoothing_factor)
     return hz_to_cents(contour, tonic)
@@ -134,19 +124,6 @@ def merge_coverage(
 def read_beats(path: Path) -> torch.Tensor:
     track = pd.read_csv(path, sep="\t", header=None, names=["time", "beat"])
     return torch.from_numpy(track["time"].to_numpy(dtype=float))
-
-
-ALL_SVARAS: tuple[str, ...] = ("S", "R", "G", "M", "P", "D", "N")
-
-RAGA_SVARAS: dict[str, tuple[str, ...]] = {
-    "abhogi": ("S", "R", "G", "M", "D"),
-    "begada": ALL_SVARAS,
-    "kalyani": ALL_SVARAS,
-    "mohanam": ("S", "R", "G", "P", "D"),
-    "sahana": ALL_SVARAS,
-    "saveri": ALL_SVARAS,
-    "sri": ALL_SVARAS,
-}
 
 
 def coverage_frames(coverage: list[list[float]], times: np.ndarray) -> list[tuple[int, int]]:
