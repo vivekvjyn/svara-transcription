@@ -1,18 +1,3 @@
-"""TRANSVARA: transcribe the test performance of each raga and print the paper tables.
-
-For each of the seven ragas this prints exactly two markdown tables for the
-reported variant (``Lsvara+Ltrans+Llength``): the note metrics and the longest
-transcribed phrases. Everything else of the original pipeline - the options
-banner, progress bars, plots, ablations, and result files - is gone; the
-compiam TCN beat tracker is gone too (beats are read from
-``data/beat_tracks/<raga>/<performer>.tsv``), and the RISE submodule has been
-replaced by the vendored model code in ``transvara/nn`` with checkpoints in
-``model_weights/``.
-
-The heavy resources (encoder, classifier, genetic search) are built only when a
-cache is missing, so with warm caches a run costs a few seconds.
-"""
-
 from __future__ import annotations
 
 import random
@@ -22,8 +7,12 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import yaml
+from rich.console import Console
+from rich.progress import Progress
+from rich.table import Table
 
 from .genetic import GeneticOptimiser
 from .metrics import (
@@ -33,6 +22,7 @@ from .metrics import (
     phrase_rows,
     reference_events,
 )
+from .plots import plot_region, plot_transcription
 from .preprocess import (
     RAGA_SVARAS,
     build_frames,
@@ -47,11 +37,15 @@ from .preprocess import (
 
 warnings.filterwarnings("ignore")
 
+console = Console(stderr=True)
+tables_console = Console()
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
-CACHE_DIR = ROOT / ".cache"
 WEIGHTS_DIR = ROOT / "model_weights"
 TRACKS_DIR = DATA_DIR / "beat_tracks"
+RESULTS_DIR = ROOT / "results"
+PLOTS_DIR = ROOT / "plots"
 
 RAGAS: tuple[str, ...] = (
     "abhogi",
@@ -73,25 +67,20 @@ TEST_PERFORMER: dict[str, str] = {
     "sri": "vignesh",
 }
 
-#: The single variant reported in the paper.
-VARIANT = "Lsvara+Ltrans+Llength"
-
-#: Phrases listed in the second table.
 PHRASE_COUNT = 10
+VARIANT = "Lsvara+Ltrans+Llength"
 
 CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text())
 SVARAS: tuple[str, ...] = tuple(CONFIG["svaras"])
+PLOT_SECONDS = CONFIG["plot_seconds"]
 EMBED_DIM = CONFIG["embed_dim"]
 EMBED_DEPTH = CONFIG["embed_depth"]
-CONTEXT_DIM = EMBED_DIM * 3
 CONTEXT_DURATION = CONFIG["context_duration"]
 ENCODE_BATCH = CONFIG["encode_batch"]
 MIN_FRAMES = CONFIG["min_frames"]
 ALPHA = CONFIG["alpha"]
 GAMMA = CONFIG["gamma"]
 
-#: The loss of the reported variant,
-#: ``L = (alpha * Lsvara + beta * Ltrans) / (alpha + beta) + gamma * Llength``.
 COST: list[float] = [ALPHA, 1.0 - ALPHA, GAMMA, 0.0]
 
 
@@ -108,23 +97,9 @@ def parse_args() -> Namespace:
     return parser.parse_args()
 
 
-def frames_for(raga: str, performer: str, tonics: dict) -> dict[str, torch.Tensor]:
-    """Contours of one performance from the cache, rebuilt from the pitch track on a miss."""
-    cache = CACHE_DIR / "datasets" / "frames" / raga / f"{performer}.pt"
-    if cache.exists():
-        stored = torch.load(cache, map_location="cpu", weights_only=False)
-    else:
-        stored = build_frames(DATA_DIR, raga, performer, tonics)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(stored, cache)
-    stored["contour"] = stored["contour"].to(torch.float32)
-    return stored
-
-
 def beat_spacing(
     beats: torch.Tensor, times: torch.Tensor
 ) -> tuple[np.ndarray, float, float]:
-    """Frame index of each beat, frames per beat, seconds per beat."""
     beat_times = beats.numpy()
     times_array = times.numpy()
     step = float(times_array[1] - times_array[0]) if len(times_array) > 1 else 0.0
@@ -140,16 +115,9 @@ def beat_spacing(
 def raga_resources(
     raga: str, args: Namespace, rng: random.Random, tonics: dict
 ) -> tuple:
-    """Encoder, svara classifier and transition model for one raga (slow path).
-
-    Built only when a genetic cache is missing: the checkpoint in
-    ``model_weights/`` feeds the vendored ``ContextualSvaraClassifier``, whose
-    features train the classifier cached under ``.cache/classifier``.
-    """
     from .nn.lora import DEFAULT_ALPHA, DEFAULT_DROPOUT, DEFAULT_RANK
     from .nn.models import ContextualSvaraClassifier
 
-    test = TEST_PERFORMER[raga]
     device = torch.device(
         args.device
         if args.device
@@ -164,31 +132,15 @@ def raga_resources(
     model.to(device)
     encode = make_encoder(model, device, MIN_FRAMES, CONTEXT_DURATION, ENCODE_BATCH)
 
-    classifier_path = CACHE_DIR / "classifier" / f"{raga}.joblib"
-    markov_path = CACHE_DIR / "markov" / f"{raga}.npz"
-    classifier = trigram = bigram = unigram = None
-    if classifier_path.exists() and markov_path.exists():
-        import joblib
-
-        candidate = joblib.load(classifier_path)
-        if candidate.named_steps["standardscaler"].n_features_in_ == CONTEXT_DIM:
-            classifier = candidate
-            stored = np.load(markov_path)
-            trigram = stored["trigram"]
-            bigram = stored["bigram"]
-            unigram = stored["unigram"]
-    if classifier is None:
-        classifier, trigram, bigram, unigram = train_classifier(
-            raga, encode, args, rng, tonics
-        )
+    classifier, trigram, bigram, unigram = train_classifier(
+        raga, encode, args, rng, tonics
+    )
     return encode, classifier, trigram, bigram, unigram
 
 
 def train_classifier(
     raga: str, encode, args: Namespace, rng: random.Random, tonics: dict
 ) -> tuple:
-    """Fit the svara classifier and transition model on the training performances."""
-    import joblib
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.pipeline import make_pipeline
@@ -196,7 +148,7 @@ def train_classifier(
 
     test = TEST_PERFORMER[raga]
     training = [
-        (performer, frames_for(raga, performer, tonics))
+        (performer, build_frames(DATA_DIR, raga, performer, tonics))
         for performer in sorted(
             pitch.stem
             for pitch in (DATA_DIR / "pitch_tracks" / raga).glob("*.tsv")
@@ -288,9 +240,6 @@ def train_classifier(
         np.asarray(features, dtype=np.float64),
         np.asarray(labels, dtype=np.int64),
     )
-    classifier_path = CACHE_DIR / "classifier" / f"{raga}.joblib"
-    classifier_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(classifier, classifier_path)
 
     classes = len(SVARAS) + 1
     trigram = np.zeros((classes, classes, classes))
@@ -304,9 +253,6 @@ def train_classifier(
         for key, value in counter.items():
             array[key] = value
     unigram = (unigram + 1e-3) / (unigram.sum() + 1e-3 * classes)
-    markov_path = CACHE_DIR / "markov" / f"{raga}.npz"
-    markov_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(markov_path, trigram=trigram, bigram=bigram, unigram=unigram)
     return classifier, trigram, bigram, unigram
 
 
@@ -320,12 +266,6 @@ def transcribe_notes(
     rng: random.Random,
     tonics: dict,
 ) -> list[tuple[int, int, int]]:
-    """The reported variant's notes, from the cache; the genetic search runs on a miss."""
-    cache = CACHE_DIR / "genetic" / raga / f"{TEST_PERFORMER[raga]}_{VARIANT}.pt"
-    if cache.exists():
-        stored = torch.load(cache, map_location="cpu", weights_only=False)
-        if stored.get("regions") == regions and stored.get("cost") == list(COST):
-            return stored["notes"]
     encode, classifier, trigram, bigram, unigram = raga_resources(
         raga, args, rng, tonics
     )
@@ -341,38 +281,62 @@ def transcribe_notes(
     notes = optimiser.transcribe(
         contour, regions, beats, beat_frames, COST[0], COST[1], COST[2], COST[3]
     )
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"notes": notes, "regions": regions, "cost": list(COST)}, cache)
     return notes
 
 
 def emit_table_1(scores: dict[str, float]) -> None:
-    """The note metrics table: F1 / precision / recall per note criterion."""
-    print("**Table 1. Note metrics**\n")
-    print("|  | COn | COnP | COnOff | COnPOff |")
-    print("|---|---|---|---|---|")
+    table = Table(title="Table 1. Note metrics")
+    table.add_column("")
+    for criterion in ("COn", "COnP", "COnOff", "COnPOff"):
+        table.add_column(criterion)
     for label, key in (("F1", "f1"), ("Precision", "precision"), ("Recall", "recall")):
-        cells = " | ".join(
-            f"{scores[f'{criterion}_{key}']:.3f}"
-            for criterion in ("con", "conp", "conoff", "conpoff")
+        table.add_row(
+            label,
+            *(
+                f"{scores[f'{criterion.lower()}_{key}']:.3f}"
+                for criterion in ("COn", "COnP", "COnOff", "COnPOff")
+            ),
         )
-        print(f"| {label} | {cells} |")
-    print()
+    tables_console.print(table)
+    tables_console.print()
 
 
 def emit_table_2(rows: list[tuple]) -> None:
-    """The longest-phrases table: transcription against annotation."""
-    print(f"**Table 2. Top {PHRASE_COUNT} longest phrases**\n")
-    print("| # | Transcription | Annotation | Lev Norm | LCS | LCS Norm | AOR |")
-    print("|---|---|---|---|---|---|---|")
+    table = Table(title=f"Table 2. Top {PHRASE_COUNT} longest phrases")
+    for column in ("#", "Transcription", "Annotation", "Lev Norm", "LCS", "LCS Norm", "AOR"):
+        table.add_column(column)
     for index, (transcription, annotation, lev, lcs, lcs_norm, aor) in enumerate(
         rows, start=1
     ):
-        print(
-            f"| {index} | {transcription} | {annotation} | "
-            f"{lev:.3f} | {lcs} | {lcs_norm:.3f} | {aor:.3f} |"
+        table.add_row(
+            str(index),
+            transcription,
+            annotation,
+            f"{lev:.3f}",
+            lcs,
+            f"{lcs_norm:.3f}",
+            f"{aor:.3f}",
         )
-    print()
+    tables_console.print(table)
+    tables_console.print()
+
+
+def write_results(raga: str, scores: dict[str, float]) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RESULTS_DIR / f"{raga}.tsv"
+    lines = ["\t".join(("", "COn", "COnP", "COnOff", "COnPOff"))]
+    for label, key in (("F1", "f1"), ("Precision", "precision"), ("Recall", "recall")):
+        lines.append(
+            "\t".join(
+                (label,)
+                + tuple(
+                    f"{scores[f'{criterion.lower()}_{key}']:.3f}"
+                    for criterion in ("COn", "COnP", "COnOff", "COnPOff")
+                )
+            )
+        )
+    path.write_text("\n".join(lines) + "\n")
+    console.print(f"results written to {path}")
 
 
 def main() -> None:
@@ -381,12 +345,20 @@ def main() -> None:
     np.random.seed(args.seed)
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     tonics = yaml.safe_load((DATA_DIR / "tonics.yaml").read_text())
 
+    progress = Progress(console=console)
+    task = progress.add_task("pipeline", total=len(RAGAS))
+    progress.start()
+
     for raga in RAGAS:
+        progress.update(task, description=f"{raga}: classifier")
         test = TEST_PERFORMER[raga]
-        held = frames_for(raga, test, tonics)
+        held = build_frames(DATA_DIR, raga, test, tonics)
         times = held["times"].numpy()
         begins, finishes, annotations = read_annotations(
             DATA_DIR / "annotations" / raga / f"{test}_{raga}.tsv"
@@ -402,6 +374,7 @@ def main() -> None:
         )
         beats, beat_frames, _ = beat_spacing(beat_times, held["times"])
 
+        progress.update(task, description=f"{raga}: transcription")
         notes = transcribe_notes(
             raga, held, regions, beats, beat_frames, args, rng, tonics
         )
@@ -420,6 +393,34 @@ def main() -> None:
         print(f"### {raga} ({test})\n")
         emit_table_1(scores)
         emit_table_2(phrases)
+
+        write_results(raga, scores)
+
+        progress.update(task, description=f"{raga}: plots")
+        region = plot_region(coverage, times, PLOT_SECONDS)
+        pitch = pd.read_csv(
+            DATA_DIR / "pitch_tracks" / raga / f"{test}.tsv",
+            sep="\t",
+            header=None,
+            names=["time", "frequency"],
+        )
+        transcription_path = PLOTS_DIR / raga / "transcription.png"
+        transcription_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_transcription(
+            pitch["time"].to_numpy(dtype=float),
+            pitch["frequency"].to_numpy(dtype=float),
+            [
+                ("ground truth", reference),
+                ("genetic algorithm", estimated),
+            ],
+            region,
+            f"transcription ({test}, {VARIANT})",
+            transcription_path,
+            coverage,
+        )
+        console.print(f"figure written to {transcription_path}")
+        progress.advance(task)
+    progress.stop()
 
 
 if __name__ == "__main__":

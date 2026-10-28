@@ -1,10 +1,3 @@
-"""Genetic optimisation of svara note boundaries.
-
-Evolves candidate boundary sequences for the annotated regions of a
-performance and scores them with the combined svara, transition, and
-length fitness of the paper's genetic algorithm.
-"""
-
 from __future__ import annotations
 
 import random
@@ -31,25 +24,6 @@ class GeneticOptimiser:
         args: Any,
         rng: random.Random,
     ) -> None:
-        """Initialise the optimiser.
-
-        :param embed_fn: function mapping boundary pairs to contextual embeddings
-        :type embed_fn: Callable[[list[tuple[int, int]]], numpy.ndarray]
-        :param classifier: trained svara classifier exposing predict_proba and predict
-        :type classifier: Any
-        :param trigram: second-order svara transition counts
-        :type trigram: numpy.ndarray
-        :param bigram: first-order svara transition counts
-        :type bigram: numpy.ndarray
-        :param unigram: normalised unigram svara distribution
-        :type unigram: numpy.ndarray
-        :param svaras: svara alphabet; its length is the none-label index
-        :type svaras: tuple[str, ...]
-        :param args: run arguments (ga_population, ga_iterations, pm, pc, pd, pa)
-        :type args: argparse.Namespace
-        :param rng: random number generator for reproducible evolution
-        :type rng: random.Random
-        """
         self.embed_fn = embed_fn
         self.classifier = classifier
         self.trigram = trigram
@@ -66,17 +40,6 @@ class GeneticOptimiser:
 
     @staticmethod
     def beat_lattice(beats: np.ndarray) -> np.ndarray:
-        """Build the candidate boundary lattice from the beat track.
-
-        Each inter-beat interval is subdivided into four equal steps, so
-        any note length that is a multiple of a 16th note, from a 16th
-        up to a whole note, is the distance between two lattice points.
-
-        :param beats: frame indices of the tracked beats
-        :type beats: numpy.ndarray
-        :return: sorted frame indices of all candidate boundaries
-        :rtype: numpy.ndarray
-        """
         if beats.size == 0:
             return np.asarray([], dtype=np.int64)
         if beats.size == 1:
@@ -90,19 +53,6 @@ class GeneticOptimiser:
 
     @staticmethod
     def _snap(lattice: np.ndarray, position: int, low: int, high: int) -> int | None:
-        """Nearest lattice point to a position within ``[low, high]``.
-
-        :param lattice: sorted candidate frame indices
-        :type lattice: numpy.ndarray
-        :param position: frame index to snap to the lattice
-        :type position: int
-        :param low: lowest acceptable frame index
-        :type low: int
-        :param high: highest acceptable frame index
-        :type high: int
-        :return: snapped frame index, or None when no lattice point fits
-        :rtype: int | None
-        """
         if lattice.size == 0 or high < low:
             return None
         index = int(np.searchsorted(lattice, position))
@@ -120,19 +70,6 @@ class GeneticOptimiser:
     def initial_boundaries(
         peaks: np.ndarray, start: int, stop: int, dmin: int
     ) -> np.ndarray:
-        """Build a seed boundary sequence covering a chunk.
-
-        :param peaks: candidate boundary frame indices (beat lattice)
-        :type peaks: numpy.ndarray
-        :param start: chunk start frame
-        :type start: int
-        :param stop: chunk end frame
-        :type stop: int
-        :param dmin: minimum distance between boundaries in frames
-        :type dmin: int
-        :return: boundary frame indices from start to stop
-        :rtype: numpy.ndarray
-        """
         boundaries = [start]
         for peak in peaks:
             if peak - boundaries[-1] < dmin:
@@ -147,21 +84,6 @@ class GeneticOptimiser:
     def repair(
         boundaries: np.ndarray, lattice: np.ndarray, dmax: int
     ) -> np.ndarray:
-        """Split any gap longer than dmax until every gap fits.
-
-        Each oversized gap is halved at the lattice point nearest the
-        midpoint; a half that is still longer than dmax is halved again,
-        so the result never contains a gap above dmax.
-
-        :param boundaries: boundary vector possibly containing oversized gaps
-        :type boundaries: numpy.ndarray
-        :param lattice: sorted candidate frame indices from the beat track
-        :type lattice: numpy.ndarray
-        :param dmax: maximum distance between boundaries in frames
-        :type dmax: int
-        :return: boundary vector with every gap at most dmax
-        :rtype: numpy.ndarray
-        """
         values = [int(value) for value in boundaries]
         index = 0
         while index < len(values) - 1:
@@ -189,28 +111,6 @@ class GeneticOptimiser:
         dmax: int,
         smax: int,
     ) -> np.ndarray:
-        """Apply insert, delete, and shift mutations within dmin/dmax limits.
-
-        Deleted boundaries may be re-inserted at the gap midpoint with
-        probability ``pa`` (always when the gap exceeds dmax), so long
-        notes split back into shorter ones. Inserted and shifted
-        boundaries snap to the beat lattice, so every child position is
-        a 16th-note, 8th-note, dotted 8th, or beat position of the
-        tracked beat grid.
-
-        :param boundaries: parent boundary vector
-        :type boundaries: numpy.ndarray
-        :param lattice: sorted candidate frame indices from the beat track
-        :type lattice: numpy.ndarray
-        :param dmin: minimum distance between boundaries in frames
-        :type dmin: int
-        :param dmax: maximum distance between boundaries in frames
-        :type dmax: int
-        :param smax: maximum shift of a boundary in frames
-        :type smax: int
-        :return: mutated boundary vector
-        :rtype: numpy.ndarray
-        """
         rng = self.rng
         values: list[int | None] = [int(value) for value in boundaries]
         for index in range(1, len(values) - 1):
@@ -252,18 +152,6 @@ class GeneticOptimiser:
         return np.asarray(kept, dtype=np.int64)
 
     def crossover(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
-        """Combine two parents at a random cut point.
-
-        The offspring keeps the start and stop boundaries of the first
-        parent; with probability ``1 - pc`` it is a copy of that parent.
-
-        :param first: first parent boundary vector
-        :type first: numpy.ndarray
-        :param second: second parent boundary vector
-        :type second: numpy.ndarray
-        :return: offspring boundary vector
-        :rtype: numpy.ndarray
-        """
         rng = self.rng
         if rng.random() >= self.pc or len(first) < 3 or len(second) < 3:
             return first.copy()
@@ -285,35 +173,6 @@ class GeneticOptimiser:
         beat_frames: float,
         voiced: np.ndarray,
     ) -> np.ndarray:
-        """Evaluate the fitness of every member of a population.
-
-        Each member is labelled with the classifier; the mean label
-        confidence (svara), the mean transition probability (trans), and
-        the mean exponential decay of the note lengths in beats
-        (length, so shorter notes score higher) are combined as
-        ``(alpha * svara + beta * trans) / (alpha + beta) + gamma * length
-        - delta * none``.  The none term counts, in eighth notes, the
-        segments labelled none that overlap voiced pitch frames, so
-        vocal material the classifier refuses to name costs one unit
-        per eighth note of its length.
-
-        :param population: candidate boundary vectors
-        :type population: list[numpy.ndarray]
-        :param alpha: weight of the svara term
-        :type alpha: float
-        :param beta: weight of the transition term
-        :type beta: float
-        :param gamma: weight of the length term
-        :type gamma: float
-        :param delta: weight of the none-over-voiced term, per eighth note
-        :type delta: float
-        :param beat_frames: frame duration of one beat
-        :type beat_frames: float
-        :param voiced: mask of contour frames carrying a pitch value
-        :type voiced: numpy.ndarray
-        :return: fitness score of each member (higher is better)
-        :rtype: numpy.ndarray
-        """
         counts = np.asarray([max(len(boundaries) - 1, 1) for boundaries in population])
         pairs = [
             pair
@@ -378,39 +237,6 @@ class GeneticOptimiser:
         delta: float,
         beat_frames: float,
     ) -> np.ndarray:
-        """Evolve the fittest boundary sequence for one chunk.
-
-        Seeds the population from the beat-lattice candidates inside the
-        chunk, then applies selection, crossover, and mutation for
-        ``args.ga_iterations`` generations.
-
-        :param contour: pitch contour frames of the whole performance
-        :type contour: numpy.ndarray
-        :param start: chunk start frame
-        :type start: int
-        :param stop: chunk end frame
-        :type stop: int
-        :param lattice: sorted candidate frame indices from the beat track
-        :type lattice: numpy.ndarray
-        :param dmin: minimum distance between boundaries in frames
-        :type dmin: int
-        :param dmax: maximum distance between boundaries in frames
-        :type dmax: int
-        :param smax: maximum shift of a boundary in frames
-        :type smax: int
-        :param alpha: weight of the svara term
-        :type alpha: float
-        :param beta: weight of the transition term
-        :type beta: float
-        :param gamma: weight of the length term
-        :type gamma: float
-        :param delta: weight of the none-over-voiced term, per eighth note
-        :type delta: float
-        :param beat_frames: frame duration of one beat
-        :type beat_frames: float
-        :return: best boundary vector found for the chunk
-        :rtype: numpy.ndarray
-        """
         rng = self.rng
         voiced = np.isfinite(contour)
         low = int(np.searchsorted(lattice, start))
@@ -463,35 +289,6 @@ class GeneticOptimiser:
         gamma: float,
         delta: float,
     ) -> list[tuple[int, int, int]]:
-        """Transcribe all annotated regions of a performance.
-
-        Splits every region into chunks of ``max(dmax * 6, dmin * 10)``
-        frames, optimises each chunk, labels the resulting segments, and
-        drops segments classified as none. All candidate boundaries come
-        from the beat track: each inter-beat interval is divided into
-        16th-note steps; every note length that is a multiple of a 16th,
-        from a 16th up to a whole note, is available, with a 16th as the
-        minimum and a whole note as the maximum.
-
-        :param contour: pitch contour frames of the whole performance
-        :type contour: numpy.ndarray
-        :param regions: annotated frame regions to transcribe
-        :type regions: list[tuple[int, int]]
-        :param beats: frame indices of the tracked beats
-        :type beats: numpy.ndarray
-        :param beat_frames: frame duration of one beat
-        :type beat_frames: float
-        :param alpha: weight of the svara term
-        :type alpha: float
-        :param beta: weight of the transition term
-        :type beta: float
-        :param gamma: weight of the length term
-        :type gamma: float
-        :param delta: weight of the none-over-voiced term, per eighth note
-        :type delta: float
-        :return: notes as (start frame, stop frame, svara label) triples
-        :rtype: list[tuple[int, int, int]]
-        """
         dmin = max(int(round(beat_frames * 0.25)), 2)
         dmax = max(int(round(beat_frames * 4.0)), dmin + 1)
         smax = max(int(round(beat_frames)), 1)

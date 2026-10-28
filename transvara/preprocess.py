@@ -1,18 +1,99 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import torch
+from scipy.interpolate import UnivariateSpline
+
+
+CENTS_PER_OCTAVE = 1200
+
+FloatArray = npt.NDArray[np.float64]
+
+
+def hz_to_cents(frequency: npt.ArrayLike, tonic: float) -> FloatArray:
+    return CENTS_PER_OCTAVE * np.log2(np.asarray(frequency, dtype=float) / tonic)
+
+
+def unvoiced_to_nan(frequency: npt.ArrayLike) -> FloatArray:
+    values = np.asarray(frequency, dtype=float).copy()
+    values[values == 0] = np.nan
+    return values
+
+
+def interpolate_gaps(
+    values: npt.ArrayLike,
+    gap_value: float = np.nan,
+    max_gap: float = 0.02,
+    protected_indices: Iterable[int] | None = None,
+) -> FloatArray:
+    contour = np.asarray(values, dtype=float).copy()
+    protected = set(protected_indices or ())
+    is_gap = np.isnan(contour) if np.isnan(gap_value) else contour == gap_value
+
+    for start, stop in _runs(is_gap):
+        if stop - start > max_gap:
+            continue
+        if protected & set(range(start, stop)):
+            continue
+        contour[start:stop] = np.nan
+
+    return pd.Series(contour).interpolate(method="linear").ffill().bfill().to_numpy()
+
+
+def smooth_contour(
+    times: npt.ArrayLike,
+    cents: npt.ArrayLike,
+    smoothing_factor: float = 0.5,
+    min_points: int = 4,
+) -> FloatArray:
+    times = np.asarray(times, dtype=float)
+    cents = np.asarray(cents, dtype=float)
+    smoothed = np.full_like(cents, np.nan)
+
+    voiced = np.where(~pd.isna(times) & ~pd.isna(cents))[0]
+    if voiced.size == 0:
+        return smoothed
+
+    for run in np.split(voiced, np.where(np.diff(voiced) > 1)[0] + 1):
+        run_times, run_cents = times[run], cents[run]
+        if run.size >= min_points:
+            low, high = run_cents.min(), run_cents.max()
+            spline = UnivariateSpline(run_times, (run_cents - low) / (high - low), s=smoothing_factor)
+            smoothed[run] = spline(run_times) * (high - low) + low
+        elif run.size > 1:
+            smoothed[run] = np.interp(run_times, run_times, run_cents)
+
+    return smoothed
+
+
+def _runs(flags: npt.NDArray[np.bool_]) -> list[tuple[int, int]]:
+    padded = np.concatenate(([False], np.asarray(flags, dtype=bool), [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True))
+
+
+def prepare_contour(
+    times: FloatArray,
+    frequency: FloatArray,
+    tonic: float,
+    smoothing_factor: float,
+    interpolation_gap: float,
+) -> FloatArray:
+    contour = unvoiced_to_nan(frequency)
+    contour = interpolate_gaps(contour, np.nan, interpolation_gap)
+    contour = smooth_contour(times, contour, smoothing_factor)
+    return hz_to_cents(contour, tonic)
 
 
 def build_frames(
     data_dir: Path, raga: str, performer: str, tonics: dict
 ) -> dict[str, torch.Tensor]:
-    from .nn.preprocessing import prepare_contour
-
     tonic = float(tonics[performer])
     track = pd.read_csv(
         data_dir / "pitch_tracks" / raga / f"{performer}.tsv",
@@ -41,11 +122,6 @@ def read_annotations(path: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
 def merge_coverage(
     begins: np.ndarray, finishes: np.ndarray, gap: float = 0.0
 ) -> list[list[float]]:
-    """Merge annotated spans, treating spans less than ``gap`` seconds apart as one.
-
-    ``gap=0.0`` merges touching spans only (the coverage used to score notes);
-    phrases are merged with ``gap=0.5`` so one sung phrase is one string.
-    """
     coverage: list[list[float]] = []
     for begin, finish in zip(begins.tolist(), finishes.tolist(), strict=True):
         if coverage and begin <= coverage[-1][1] + gap:
@@ -56,12 +132,10 @@ def merge_coverage(
 
 
 def read_beats(path: Path) -> torch.Tensor:
-    """Beat times from an exported ``data/beat_tracks`` TSV (``time`` / ``beat``)."""
     track = pd.read_csv(path, sep="\t", header=None, names=["time", "beat"])
     return torch.from_numpy(track["time"].to_numpy(dtype=float))
 
 
-#: The seven svaras and the subset each raga draws from (vendored from RISE).
 ALL_SVARAS: tuple[str, ...] = ("S", "R", "G", "M", "P", "D", "N")
 
 RAGA_SVARAS: dict[str, tuple[str, ...]] = {

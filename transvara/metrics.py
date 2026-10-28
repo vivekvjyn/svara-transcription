@@ -65,7 +65,6 @@ def lcs_length(first: str, second: str) -> int:
 
 
 def lcs_text(first: str, second: str) -> str:
-    """One longest common subsequence of the two strings."""
     table = [[0] * (len(second) + 1) for _ in range(len(first) + 1)]
     for row, character in enumerate(first, start=1):
         for column, other in enumerate(second, start=1):
@@ -95,12 +94,6 @@ def phrase_rows(
     window: float,
     count: int = 10,
 ) -> list[tuple[str, str, float, str, float, float]]:
-    """The ``count`` longest test phrases and their string scores.
-
-    Each row is ``(transcription, annotation, lev norm, lcs, lcs norm, aor)``,
-    with both strings taken from the notes starting inside the phrase and the
-    scores normalised by the annotation string's length.
-    """
     symbols = svaras()
     ordered = sorted(phrases, key=lambda span: span[1] - span[0], reverse=True)
     rows: list[tuple[str, str, float, str, float, float]] = []
@@ -130,7 +123,6 @@ def average_overlap_ratio(
     symbols: tuple[str, ...],
     window: float,
 ) -> float:
-    """mir_eval's average overlap ratio of correct notes, 0.0 without notes."""
     if not reference or not estimated:
         return 0.0
     ref_intervals = np.array([[note[0], note[1]] for note in reference], dtype=float)

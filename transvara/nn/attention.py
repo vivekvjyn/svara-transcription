@@ -1,12 +1,3 @@
-"""Co-attention over the preceding, current and succeeding encodings.
-
-Which form a *svara* takes depends on the *svaras* around it, but not every frame
-of that surrounding context matters equally. Attention is therefore computed with
-respect to the final hidden state of the *current* encoder, so that each of the
-three streams is summarised by whatever part of it is relevant to the *svara*
-being classified, rather than by a fixed pooling.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -30,12 +21,6 @@ class CoAttention(nn.Module):
         self.project = nn.Linear(embed_dim, embed_dim, bias=False)
 
     def forward(self, hidden_states: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-        """Summarise ``hidden_states`` with respect to ``reference``.
-
-        ``hidden_states`` is ``(batch, frames, embed_dim)`` and ``reference`` is the
-        ``(batch, 1, embed_dim)`` final hidden state of the current stream. Returns
-        the ``(batch, embed_dim)`` context vector.
-        """
         scores = torch.bmm(self.project(hidden_states), reference.permute(0, 2, 1))
         weights = scores.softmax(dim=1)
         return torch.bmm(hidden_states.permute(0, 2, 1), weights).squeeze(-1)

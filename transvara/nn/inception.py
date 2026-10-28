@@ -1,13 +1,3 @@
-"""InceptionTime encoder and its transposed counterpart, the synthesis decoder.
-
-The encoder follows InceptionTime (Ismail Fawaz et al., 2020): a stack of blocks,
-each of which convolves its input with three kernels of different width in
-parallel and adds a bottleneck residual. The three widths give one block a view of
-a *svara* at three time scales at once — roughly a single inflection, a lobe of an
-oscillation, and a whole ornament — which is what lets a fixed-depth stack cope
-with contours whose ornamentation varies from slow to very fast.
-"""
-
 from __future__ import annotations
 
 from itertools import pairwise
@@ -15,25 +5,14 @@ from itertools import pairwise
 import torch
 from torch import nn
 
-#: Receptive field of the three parallel branches, in frames.
 KERNEL_SIZES = (9, 19, 39)
 
-#: Number of parallel convolutional branches per block.
 NUM_BRANCHES = len(KERNEL_SIZES)
 
-#: Branch attribute names used before the branches became a :class:`~torch.nn.ModuleList`.
-#: Checkpoints published with the paper still carry them, so they are remapped on load.
 LEGACY_BRANCH_PREFIXES = tuple(f"branch{index + 1}." for index in range(NUM_BRANCHES))
 
 
 def branch_widths(out_channels: int) -> list[int]:
-    """Split ``out_channels`` across the branches, giving the remainder to the first.
-
-    The three branch outputs are concatenated and added to a residual of width
-    ``out_channels``, so the widths have to sum to exactly ``out_channels``. Any
-    ``out_channels`` divisible by :data:`NUM_BRANCHES` — as every configuration in
-    ``configs.yaml`` is — splits evenly and the remainder term vanishes.
-    """
     base, remainder = divmod(out_channels, NUM_BRANCHES)
     return [base + (1 if index < remainder else 0) for index in range(NUM_BRANCHES)]
 
@@ -154,7 +133,6 @@ class InceptionDecoder(nn.Module):
         )
 
     def forward(self, embeddings: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Return ``(batch, 2, num_frames)``: normalised pitch, then silence mask."""
         for step, block in enumerate(self.blocks):
             embeddings = block(embeddings)
             size = num_frames // 2 ** (self.depth - 2 - step)
