@@ -7,9 +7,9 @@ from collections import Counter
 from pathlib import Path
 
 import Levenshtein
+import librosa
 import mir_eval
 import numpy as np
-import pandas as pd
 import torch
 import yaml
 from rich.console import Console
@@ -370,6 +370,7 @@ def main() -> None:
             key=lambda span: span[1] - span[0],
             reverse=True,
         )[:PHRASE_COUNT]
+        rows = []
         for index, (begin, finish) in enumerate(phrases, start=1):
             ref_notes = [note for note in reference if begin <= note[0] < finish]
             est_notes = [note for note in estimated if begin <= note[0] < finish]
@@ -399,21 +400,27 @@ def main() -> None:
                     )[3]
                 )
             )
-            table.add_row(
-                str(index),
-                transcription,
-                annotation,
-                f"{Levenshtein.distance(annotation, transcription) / max(len(annotation), 1):.3f}",
-                common,
-                f"{len(common) / max(len(annotation), 1):.3f}",
-                f"{aor:.3f}",
+            rows.append(
+                (
+                    str(index),
+                    transcription,
+                    annotation,
+                    f"{Levenshtein.distance(annotation, transcription) / max(len(annotation), 1):.3f}",
+                    common,
+                    f"{len(common) / max(len(annotation), 1):.3f}",
+                    f"{aor:.3f}",
+                )
             )
+        for row in rows:
+            table.add_row(*row)
         tables_console.print(table)
         tables_console.print()
 
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        results_path = RESULTS_DIR / f"{raga}.tsv"
-        results_path.write_text(
+        results_dir = RESULTS_DIR / raga
+        results_dir.mkdir(parents=True, exist_ok=True)
+        table1_path = results_dir / "table1.tsv"
+        table1_path.write_text(
             "\t".join(("", "COn", "COnP", "COnOff", "COnPOff"))
             + "\n"
             + "\n".join(
@@ -432,21 +439,31 @@ def main() -> None:
             )
             + "\n"
         )
-        console.print(f"results written to {results_path}")
+        console.print(f"results written to {table1_path}")
+
+        table2_path = results_dir / "table2.tsv"
+        table2_path.write_text(
+            "\t".join(
+                ("#", "Transcription", "Annotation", "Lev Norm", "LCS", "LCS Norm", "AOR")
+            )
+            + "\n"
+            + "\n".join("\t".join(row) for row in rows)
+            + "\n"
+        )
+        console.print(f"results written to {table2_path}")
 
         progress.update(task, description=f"{raga}: plots")
         region = plot_region(coverage, times, PLOT_SECONDS)
-        pitch = pd.read_csv(
-            DATA_DIR / "pitch_tracks" / raga / f"{test}.tsv",
-            sep="\t",
-            header=None,
-            names=["time", "frequency"],
+        signal, _ = librosa.load(
+            DATA_DIR / "audio" / raga / f"{test}.mp3",
+            sr=args.sample_rate,
+            mono=True,
         )
         transcription_path = PLOTS_DIR / raga / "transcription.png"
         transcription_path.parent.mkdir(parents=True, exist_ok=True)
         plot_transcription(
-            pitch["time"].to_numpy(dtype=float),
-            pitch["frequency"].to_numpy(dtype=float),
+            signal,
+            args.sample_rate,
             [
                 ("ground truth", reference),
                 ("genetic algorithm", estimated),
@@ -456,6 +473,7 @@ def main() -> None:
             transcription_path,
             coverage,
         )
+        del signal
         console.print(f"figure written to {transcription_path}")
         progress.advance(task)
     progress.stop()
@@ -469,6 +487,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--pa", type=float, default=0.75)
     parser.add_argument("--ga-population", type=int, default=40)
     parser.add_argument("--ga-iterations", type=int, default=50)
+    parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()

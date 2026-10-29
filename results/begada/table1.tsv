@@ -1,0 +1,4 @@
+	COn	COnP	COnOff	COnPOff
+F1	0.682	0.493	0.503	0.385
+Precision	0.890	0.643	0.656	0.502
+Recall	0.553	0.400	0.408	0.312

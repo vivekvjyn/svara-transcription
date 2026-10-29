@@ -59,8 +59,8 @@ def _svara_colour(svara: str):
 
 
 def plot_transcription(
-    pitch_times: npt.NDArray[np.float64],
-    pitch: npt.NDArray[np.float64],
+    waveform: npt.NDArray[np.float32],
+    sample_rate: int,
     conditions: list[tuple[str, list[tuple[float, float, str]]]],
     region: tuple[float, float],
     title: str,
@@ -69,11 +69,14 @@ def plot_transcription(
 ) -> None:
     apply_plot_style()
     start, stop = region
-    selected = (pitch_times >= start) & (pitch_times <= stop)
-    times = pitch_times[selected]
-    clip = pitch[selected]
-    finite = clip[np.isfinite(clip)]
-    peak = float(np.max(np.abs(finite))) if finite.size else 1.0
+    first = int(max(start, 0.0) * sample_rate)
+    last = int(min(stop, len(waveform) / sample_rate) * sample_rate)
+    times = np.arange(first, last) / sample_rate
+    clip = waveform[first:last]
+    stride = max(len(times) // 20000, 1)
+    times = times[::stride]
+    clip = clip[::stride]
+    peak = float(np.max(np.abs(clip))) if clip.size else 1.0
     peak = max(peak, 1e-6)
     band = 0.22 * peak
     top = peak + 0.5 * peak
