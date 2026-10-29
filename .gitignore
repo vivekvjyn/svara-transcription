@@ -2,4 +2,3 @@
 *.py[cod]
 *.egg-info
 model_weights
-*.mp3

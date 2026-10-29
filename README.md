@@ -1,4 +1,6 @@
-# Transvara
+# Svara Transcription
+
+Svara transcription using Genetic Algorithm using [RISE](https://github.com/MTG/RISE) and `TCNCarnatic` beattracker from [compIAM](https://github.com/MTG/compIAM).
 
 ## Setup
 
